@@ -118,7 +118,7 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
   const finalText = storedText || (mediaType === "photo" ? "[截圖]" : "[PDF 文件]");
 
   try {
-    await db
+    const inserted = await db
       .insert(rawMessages)
       .values({
         telegramUpdateId: update.update_id,
@@ -132,7 +132,23 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
         mediaType,
         mediaFileId,
       })
-      .onConflictDoNothing();
+      .onConflictDoNothing()
+      .returning({ id: rawMessages.id });
+
+    // Only ack if we actually stored a new row (not a duplicate)
+    if (inserted.length > 0) {
+      const ackParts: string[] = [];
+      if (mediaType === "photo") ackParts.push("📷 截圖");
+      else if (mediaType === "pdf") ackParts.push("📄 PDF");
+      else ackParts.push("📝 訊息");
+      ackParts.push("已收到，AI 分析中…（通常 5 分鐘內完成）");
+
+      await sendMessage({
+        chat_id: msg.chat.id,
+        text: ackParts.join(""),
+        parse_mode: "HTML",
+      });
+    }
   } catch (err) {
     console.error("[webhook] DB insert failed:", err);
   }
