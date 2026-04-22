@@ -33,6 +33,11 @@ export async function GET(req: NextRequest) {
   // Normalise invite code the same way validateInviteCode / redeemInviteCode do.
   const inviteCode =
     searchParams.get("invite_code")?.trim().toUpperCase() ?? null;
+  const telegramIdRaw = searchParams.get("telegram_id");
+  const telegramId =
+    telegramIdRaw && /^\d+$/.test(telegramIdRaw)
+      ? parseInt(telegramIdRaw, 10)
+      : null;
 
   if (!code) {
     return NextResponse.redirect(`${origin}/auth/login?error=missing_code`);
@@ -73,7 +78,11 @@ export async function GET(req: NextRequest) {
         // 1. Insert the user profile row
         await tx
           .insert(userProfiles)
-          .values({ id: userId, role: "member" })
+          .values({
+            id: userId,
+            role: "member",
+            ...(telegramId !== null ? { telegramId } : {}),
+          })
           .onConflictDoNothing(); // idempotent — safe if called twice somehow
 
         // 2. Redeem the invite code atomically.
