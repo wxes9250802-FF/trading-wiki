@@ -64,6 +64,12 @@ export const rawMessages = pgTable("raw_messages", {
   // Telegram file_id — stable, used to download the file during classification
   mediaFileId: text("media_file_id"),
 
+  // SHA-256 hash (first 16 hex chars) of normalised message text.
+  // Used for 24-hour deduplication: same content from different users
+  // returns the cached classification instead of re-running the AI.
+  // Null for media-only messages (no meaningful text to hash).
+  contentHash: text("content_hash"),
+
   // Set by T6 worker on successful classification
   aiTipId: uuid("ai_tip_id"),
 
