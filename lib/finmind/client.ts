@@ -150,6 +150,58 @@ export async function fetchLatestPrice(stockId: string): Promise<number | null> 
 }
 
 /**
+ * Fetch daily OHLCV data for a stock from a given start date.
+ * Uses TaiwanStockPrice dataset — returns the rows sorted by date ascending.
+ * Returns null on network/API failure; returns [] when FinMind has no data
+ * for the requested range (e.g., non-trading day).
+ */
+export async function fetchDailyOHLCV(
+  stockId: string,
+  startDate: string // "YYYY-MM-DD"
+): Promise<Array<{
+  date: string;
+  open: number;
+  close: number;
+  high: number;
+  low: number;
+  volume: number;
+}> | null> {
+  const token = getToken();
+  if (!token) return null;
+
+  const id = stripSuffix(stockId);
+
+  try {
+    const url = new URL(FINMIND_BASE);
+    url.searchParams.set("dataset", "TaiwanStockPrice");
+    url.searchParams.set("data_id", id);
+    url.searchParams.set("start_date", startDate);
+    url.searchParams.set("token", token);
+
+    const res = await fetch(url.toString(), {
+      signal: AbortSignal.timeout(15_000),
+    });
+
+    if (!res.ok) return null;
+
+    const json = (await res.json()) as FinMindResponse<StockPriceRecord>;
+    if (json.status !== 200 || !json.data) return null;
+    if (json.data.length === 0) return [];
+
+    return json.data.map((r) => ({
+      date: r.date,
+      open: r.open,
+      close: r.close,
+      high: r.max,
+      low: r.min,
+      volume: r.Trading_Volume,
+    }));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch institutional investor buy/sell data for a stock.
  * Designed for future T5 use — returns null on any error.
  */

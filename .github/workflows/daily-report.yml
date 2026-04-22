@@ -1,0 +1,30 @@
+name: Daily Closing Report
+
+on:
+  schedule:
+    # 19:00 Taipei Time = 11:00 UTC
+    # Runs Monday–Friday only (weekends have no closing data)
+    - cron: "0 11 * * 1-5"
+  workflow_dispatch:
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+      - run: bun install --frozen-lockfile
+      - name: Run daily report
+        run: bun run scripts/daily-report.ts
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          SKIP_ENV_VALIDATION: "true"

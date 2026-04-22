@@ -17,7 +17,8 @@
     "telegram:register": "bun run scripts/register-webhook.ts",
     "ai:classify": "bun run scripts/classify-messages.ts",
     "ai:verify": "bun run scripts/verify-tips.ts",
-    "bootstrap:admin": "bun run scripts/bootstrap-admin.ts"
+    "bootstrap:admin": "bun run scripts/bootstrap-admin.ts",
+    "daily:report": "bun run scripts/daily-report.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.90.0",
