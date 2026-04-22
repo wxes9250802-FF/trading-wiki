@@ -244,7 +244,7 @@ async function handleCommand(
           "",
           "可用指令：",
           "/q 股票代號 — 查詢某支股票的所有情報",
-          "/mystats — 查看我的情報統計",
+          "/stats — 查看情報總覽統計",
           "/help — 顯示此說明",
           "",
           "（管理員限定）",
@@ -373,11 +373,10 @@ async function handleCommand(
       return;
     }
 
-    if (command === "/mystats") {
+    if (command === "/stats" || command === "/mystats") {
       const rows = await db
         .select({ market: tips.market, sentiment: tips.sentiment })
-        .from(tips)
-        .where(eq(tips.telegramUserId, telegramUserId));
+        .from(tips);
 
       const total = rows.length;
       const tw = rows.filter((r) => r.market === "TW").length;
@@ -390,7 +389,7 @@ async function handleCommand(
       await sendMessage({
         chat_id: chatId,
         text: [
-          "📊 <b>我的情報統計</b>",
+          "📊 <b>情報總覽</b>",
           "",
           `<b>共 ${total} 筆情報</b>`,
           "",
