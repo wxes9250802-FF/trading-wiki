@@ -25,7 +25,7 @@ import {
   editMessageReplyMarkup,
   sendMessage,
 } from "@/lib/telegram/client";
-import type { TelegramUpdate, TelegramCallbackQuery } from "@/lib/telegram/types";
+import type { TelegramUpdate, TelegramCallbackQuery, TelegramMessage } from "@/lib/telegram/types";
 
 const MAX_TEXT_CHARS = 2000;
 const WEBHOOK_SECRET = process.env["TELEGRAM_WEBHOOK_SECRET"];
@@ -68,7 +68,14 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
   const telegramUserId = msg.from?.id;
   if (!telegramUserId) return;
 
-  const text = rawText.trim();
+  // Detect supported media (photo or PDF)
+  const hasPhoto = !!(msg.photo?.length);
+  const hasPdf = msg.document?.mime_type === "application/pdf";
+
+  // Skip if no text AND no supported media (e.g. stickers, voice, video)
+  if (!rawText?.trim() && !hasPhoto && !hasPdf) return;
+
+  const text = (rawText ?? "").trim();
 
   // /start <code> — new user invite redemption, runs BEFORE allowlist check
   const startMatch = /^\/start(?:@\S+)?(?:\s+(\S+))?$/i.exec(text);
@@ -104,6 +111,12 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
   const truncated = text.length > MAX_TEXT_CHARS;
   const storedText = truncated ? text.slice(0, MAX_TEXT_CHARS) : text;
 
+  // Resolve media info: largest photo size, or PDF document
+  const { mediaType, mediaFileId } = resolveMedia(msg);
+
+  // Placeholder text for media-only messages (no caption)
+  const finalText = storedText || (mediaType === "photo" ? "[截圖]" : "[PDF 文件]");
+
   try {
     await db
       .insert(rawMessages)
@@ -112,10 +125,12 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
         telegramUserId,
         telegramChatId: msg.chat.id,
         telegramMessageId: msg.message_id,
-        messageText: storedText,
+        messageText: finalText,
         messageDate: new Date(msg.date * 1000),
         truncated,
         status: "pending",
+        mediaType,
+        mediaFileId,
       })
       .onConflictDoNothing();
   } catch (err) {
@@ -441,6 +456,17 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function resolveMedia(msg: TelegramMessage): { mediaType: string | null; mediaFileId: string | null } {
+  if (msg.photo?.length) {
+    const largest = msg.photo[msg.photo.length - 1]!;
+    return { mediaType: "photo", mediaFileId: largest.file_id };
+  }
+  if (msg.document?.mime_type === "application/pdf") {
+    return { mediaType: "pdf", mediaFileId: msg.document.file_id };
+  }
+  return { mediaType: null, mediaFileId: null };
+}
 
 function ok() {
   return new NextResponse(null, { status: 200 });
