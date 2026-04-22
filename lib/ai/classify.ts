@@ -3,7 +3,7 @@ import { z } from "zod";
 
 // ─── Model ────────────────────────────────────────────────────────────────────
 
-export const DEFAULT_MODEL = "claude-3-5-haiku-20241022";
+export const DEFAULT_MODEL = "claude-haiku-4-5";
 
 /** Bump this string whenever the prompt changes. Stored in ai_classifications. */
 export const PROMPT_VERSION = "classify-v1";
