@@ -13,12 +13,12 @@
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
-import { eq, and, isNull, gt } from "drizzle-orm";
+import { eq, and, isNull, gt, inArray, desc } from "drizzle-orm";
 import { db } from "@/lib/db/client";
 import { createSupabaseAdminClient } from "@/lib/auth/admin";
 import { userProfiles, inviteCodes } from "@/lib/db/schema/users";
 import { rawMessages } from "@/lib/db/schema/raw-messages";
-import { aiClassifications } from "@/lib/db/schema/classifications";
+import { aiClassifications, tipTickers } from "@/lib/db/schema/classifications";
 import { tips } from "@/lib/db/schema/tips";
 import {
   answerCallbackQuery,
@@ -178,11 +178,15 @@ async function handleCommand(
           "🤖 <b>Trading Intelligence Hub</b>",
           "",
           "可用指令：",
+          "/q 股票代號 — 查詢某支股票的所有情報",
           "/mystats — 查看我的情報統計",
           "/help — 顯示此說明",
           "",
           "（管理員限定）",
           "/invite — 產生新邀請碼",
+          "",
+          "範例：",
+          "<code>/q 2330</code>　<code>/q NVDA</code>　<code>/q BTC</code>",
         ].join("\n"),
         parse_mode: "HTML",
       });
@@ -214,6 +218,91 @@ async function handleCommand(
           "",
           "對方點擊後在 Telegram 開啟，即可自動加入，無需填寫任何資料。",
         ].join("\n"),
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    if (command === "/q") {
+      const parts = rawCommand.trim().split(/\s+/);
+      const rawSymbol = parts[1]?.toUpperCase() ?? "";
+
+      if (!rawSymbol) {
+        await sendMessage({
+          chat_id: chatId,
+          text: "❓ 用法：<code>/q 股票代號</code>\n例如：<code>/q 2330</code>、<code>/q NVDA</code>、<code>/q BTC</code>",
+          parse_mode: "HTML",
+        });
+        return;
+      }
+
+      // Expand bare Taiwan 4-6 digit codes to .TW / .TWO variants
+      const variants: string[] = [rawSymbol];
+      if (/^\d{4,6}$/.test(rawSymbol)) {
+        variants.push(`${rawSymbol}.TW`, `${rawSymbol}.TWO`);
+      }
+
+      const rows = await db
+        .select({
+          sentiment: tipTickers.sentiment,
+          targetPrice: tipTickers.targetPrice,
+          summary: tips.summary,
+          confidence: tips.confidence,
+          market: tips.market,
+          createdAt: tips.createdAt,
+        })
+        .from(tipTickers)
+        .innerJoin(tips, eq(tipTickers.tipId, tips.id))
+        .where(inArray(tipTickers.symbol, variants))
+        .orderBy(desc(tips.createdAt))
+        .limit(20);
+
+      if (rows.length === 0) {
+        await sendMessage({
+          chat_id: chatId,
+          text: `找不到 <b>${rawSymbol}</b> 的情報記錄。\n\n可能原因：\n• 代號不正確（台股請用 4 位數字，如 <code>2330</code>）\n• 尚未有任何情報提及此標的`,
+          parse_mode: "HTML",
+        });
+        return;
+      }
+
+      const total = rows.length;
+      const bullish = rows.filter((r) => r.sentiment === "bullish").length;
+      const bearish = rows.filter((r) => r.sentiment === "bearish").length;
+      const neutral = rows.filter((r) => r.sentiment === "neutral").length;
+
+      // Format recent tips (up to 5)
+      const recentLines = rows.slice(0, 5).map((r) => {
+        const icon =
+          r.sentiment === "bullish" ? "📈" : r.sentiment === "bearish" ? "📉" : "➡️";
+        const date = new Date(r.createdAt).toLocaleDateString("zh-TW", {
+          month: "2-digit",
+          day: "2-digit",
+        });
+        const target = r.targetPrice ? ` 目標 ${parseFloat(r.targetPrice).toLocaleString()}` : "";
+        const conf = r.confidence != null ? ` (${r.confidence}分)` : "";
+        const summary = r.summary ? `\n  ${r.summary}` : "";
+        return `• ${date} ${icon}${target}${conf}${summary}`;
+      });
+
+      const lines = [
+        `📊 <b>${rawSymbol} 情報查詢</b>`,
+        "",
+        `<b>共 ${total} 筆情報</b>`,
+        "",
+        `📈 看多 ${bullish}　📉 看空 ${bearish}　➡️ 中性 ${neutral}`,
+        "",
+        "<b>最近情報：</b>",
+        ...recentLines,
+      ];
+
+      if (total > 5) {
+        lines.push("", `⋯ 顯示最近 5 筆，共 ${total} 筆`);
+      }
+
+      await sendMessage({
+        chat_id: chatId,
+        text: lines.join("\n"),
         parse_mode: "HTML",
       });
       return;
