@@ -162,14 +162,12 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
       .limit(1);
 
     if (cached) {
-      const MARKET: Record<string, string> = { TW: "🇹🇼 台股", US: "🇺🇸 美股", CRYPTO: "₿ 加密貨幣" };
       const SENT: Record<string, string> = { bullish: "📈 看多", bearish: "📉 看空", neutral: "➡️ 中性" };
       await sendMessage({
         chat_id: msg.chat.id,
         text: [
           "📋 <b>此情報 24 小時內已有人提過</b>，直接沿用分析結果：",
           "",
-          `<b>市場：</b>${MARKET[cached.market ?? ""] ?? cached.market}`,
           `<b>方向：</b>${SENT[cached.sentiment ?? ""] ?? cached.sentiment}`,
           cached.confidence != null ? `<b>信心：</b>${cached.confidence}/100` : "",
           cached.ticker ? `<b>主標的：</b>${cached.ticker}` : "",
@@ -374,13 +372,10 @@ async function handleCommand(
 
     if (command === "/stats") {
       const rows = await db
-        .select({ market: tips.market, sentiment: tips.sentiment })
+        .select({ sentiment: tips.sentiment })
         .from(tips);
 
       const total = rows.length;
-      const tw = rows.filter((r) => r.market === "TW").length;
-      const us = rows.filter((r) => r.market === "US").length;
-      const crypto = rows.filter((r) => r.market === "CRYPTO").length;
       const bullish = rows.filter((r) => r.sentiment === "bullish").length;
       const bearish = rows.filter((r) => r.sentiment === "bearish").length;
       const neutral = rows.filter((r) => r.sentiment === "neutral").length;
@@ -391,11 +386,6 @@ async function handleCommand(
           "📊 <b>情報總覽</b>",
           "",
           `<b>共 ${total} 筆情報</b>`,
-          "",
-          "<b>市場分佈：</b>",
-          `🇹🇼 台股：${tw} 筆`,
-          `🇺🇸 美股：${us} 筆`,
-          `₿ 加密貨幣：${crypto} 筆`,
           "",
           "<b>方向分佈：</b>",
           `📈 看多：${bullish} 筆`,

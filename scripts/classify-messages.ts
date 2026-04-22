@@ -127,12 +127,6 @@ async function resolveSymbol(raw: string): Promise<string> {
 
 // ─── Notification helpers ─────────────────────────────────────────────────────
 
-const MARKET_LABEL: Record<string, string> = {
-  TW: "🇹🇼 台股",
-  US: "🇺🇸 美股",
-  CRYPTO: "₿ 加密貨幣",
-};
-
 const SENTIMENT_LABEL: Record<string, string> = {
   bullish: "📈 看多",
   bearish: "📉 看空",
@@ -140,7 +134,6 @@ const SENTIMENT_LABEL: Record<string, string> = {
 };
 
 function buildTipMessage(opts: {
-  market: string;
   sentiment: string;
   confidence: number;
   summary: string;
@@ -149,7 +142,6 @@ function buildTipMessage(opts: {
   const lines = [
     "📊 <b>新情報分類完成</b>",
     "",
-    `<b>市場：</b>${MARKET_LABEL[opts.market] ?? opts.market}`,
     `<b>方向：</b>${SENTIMENT_LABEL[opts.sentiment] ?? opts.sentiment}`,
     `<b>信心：</b>${opts.confidence}/100`,
   ];
@@ -287,7 +279,6 @@ async function processMessage(msg: RawMessage): Promise<void> {
         // ── T8: send confirmation notification (outside tx — non-critical) ──
         if (classification) {
           const text = buildTipMessage({
-            market: result.market,
             sentiment: result.sentiment,
             confidence: result.confidence,
             summary: result.summary,
@@ -314,7 +305,7 @@ async function processMessage(msg: RawMessage): Promise<void> {
         const tipTargetPrice = primaryRaw?.target_price ?? null;
         if (result.sentiment !== "neutral" && primarySymbol && tipTargetPrice) {
           try {
-            const priceAtTip = await fetchCurrentPrice(primarySymbol, result.market);
+            const priceAtTip = await fetchCurrentPrice(primarySymbol);
 
             if (priceAtTip !== null) {
               // Idempotency: skip if a row already exists (e.g. on retry)

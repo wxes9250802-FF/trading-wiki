@@ -51,3 +51,8 @@ next-env.d.ts
 
 # Test coverage
 coverage/
+
+.vercel
+
+# Supabase CLI local state
+supabase/

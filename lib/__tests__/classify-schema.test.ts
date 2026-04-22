@@ -76,11 +76,9 @@ describe("classifySchema — tip (is_tip: true)", () => {
     }
   });
 
-  it("accepts all three market values", () => {
-    for (const market of ["TW", "US", "CRYPTO"] as const) {
-      const result = classifySchema.safeParse({ ...VALID_TIP, market });
-      expect(result.success, `market=${market} should be valid`).toBe(true);
-    }
+  it("accepts market='TW' (the only valid value)", () => {
+    const result = classifySchema.safeParse({ ...VALID_TIP, market: "TW" });
+    expect(result.success).toBe(true);
   });
 
   it("accepts all three sentiment values at the tip level", () => {
@@ -115,19 +113,12 @@ describe("classifySchema — tip (is_tip: true)", () => {
     expect(result.success).toBe(true);
   });
 
-  it("accepts a US market tip with uppercase symbol", () => {
-    const tip = {
-      ...VALID_TIP,
-      market: "US" as const,
-      tickers: [{ symbol: "NVDA", sentiment: "bullish" as const, target_price: 900 }],
-    };
-    expect(classifySchema.parse(tip).is_tip).toBe(true);
-  });
-
   // ── Validation failures ──────────────────────────────────────────────────
 
-  it("rejects an invalid market value", () => {
-    expect(classifySchema.safeParse({ ...VALID_TIP, market: "JP" }).success).toBe(false);
+  it("rejects any non-TW market value (US/CRYPTO/JP etc.)", () => {
+    for (const market of ["US", "CRYPTO", "JP"]) {
+      expect(classifySchema.safeParse({ ...VALID_TIP, market }).success).toBe(false);
+    }
   });
 
   it("rejects an invalid sentiment value", () => {
@@ -171,10 +162,10 @@ describe("classifySchema — tip (is_tip: true)", () => {
     expect(classifySchema.safeParse(tip).success).toBe(false);
   });
 
-  it("rejects a ticker symbol longer than 30 chars", () => {
+  it("rejects a ticker symbol longer than 10 chars", () => {
     const tip = {
       ...VALID_TIP,
-      tickers: [{ symbol: "A".repeat(31), sentiment: "bullish" as const }],
+      tickers: [{ symbol: "1".repeat(11), sentiment: "bullish" as const }],
     };
     expect(classifySchema.safeParse(tip).success).toBe(false);
   });
@@ -182,7 +173,7 @@ describe("classifySchema — tip (is_tip: true)", () => {
   it("rejects a negative target_price", () => {
     const tip = {
       ...VALID_TIP,
-      tickers: [{ symbol: "AAPL", sentiment: "bullish" as const, target_price: -10 }],
+      tickers: [{ symbol: "2330", sentiment: "bullish" as const, target_price: -10 }],
     };
     expect(classifySchema.safeParse(tip).success).toBe(false);
   });
@@ -190,7 +181,7 @@ describe("classifySchema — tip (is_tip: true)", () => {
   it("rejects a zero target_price (must be positive)", () => {
     const tip = {
       ...VALID_TIP,
-      tickers: [{ symbol: "AAPL", sentiment: "bullish" as const, target_price: 0 }],
+      tickers: [{ symbol: "2330", sentiment: "bullish" as const, target_price: 0 }],
     };
     expect(classifySchema.safeParse(tip).success).toBe(false);
   });
