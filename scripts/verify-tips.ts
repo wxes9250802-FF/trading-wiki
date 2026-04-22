@@ -53,7 +53,6 @@ interface PendingTarget {
   priceAtTip: string;
   targetPrice: string;
   ticker: string;
-  market: "TW" | "US" | "CRYPTO";
   sentiment: "bullish" | "bearish";
   telegramChatId: number;
   createdAt: Date;
@@ -72,14 +71,12 @@ function isHit(
 
 function buildHitMessage(opts: {
   ticker: string;
-  market: "TW" | "US" | "CRYPTO";
   sentiment: "bullish" | "bearish";
   targetPrice: number;
   priceAtCheck: number;
   priceAtTip: number;
   daysElapsed: number;
 }): string {
-  const currency = opts.market === "TW" ? "NT$" : opts.market === "CRYPTO" ? "" : "$";
   const dirIcon = opts.sentiment === "bullish" ? "📈" : "📉";
   const dirLabel = opts.sentiment === "bullish" ? "看多" : "看空";
   const pct = (((opts.priceAtCheck - opts.priceAtTip) / opts.priceAtTip) * 100).toFixed(2);
@@ -90,11 +87,11 @@ function buildHitMessage(opts: {
     "",
     `<b>標的：</b>${opts.ticker}`,
     `<b>方向：</b>${dirIcon} ${dirLabel}`,
-    `<b>目標價：</b>${currency}${opts.targetPrice.toFixed(2)}`,
-    `<b>目前價：</b>${currency}${opts.priceAtCheck.toFixed(2)}`,
-    `<b>進場價：</b>${currency}${opts.priceAtTip.toFixed(2)}（${pctStr}）`,
+    `<b>目標價：</b>NT$${opts.targetPrice.toFixed(2)}`,
+    `<b>目前價：</b>NT$${opts.priceAtCheck.toFixed(2)}`,
+    `<b>進場價：</b>NT$${opts.priceAtTip.toFixed(2)}（${pctStr}）`,
     "",
-    `你在 ${opts.daysElapsed} 天前提的情報達標了 🎉`,
+    `${opts.daysElapsed} 天前的情報達標 🎉`,
   ].join("\n");
 }
 
@@ -108,7 +105,6 @@ async function fetchPendingTargets(): Promise<PendingTarget[]> {
       priceAtTip: tipVerifications.priceAtTip,
       targetPrice: tipVerifications.targetPrice,
       ticker: tips.ticker,
-      market: tips.market,
       sentiment: tips.sentiment,
       telegramChatId: tips.telegramChatId,
       createdAt: tipVerifications.createdAt,
@@ -121,7 +117,6 @@ async function fetchPendingTargets(): Promise<PendingTarget[]> {
         isNotNull(tipVerifications.targetPrice),
         isNotNull(tipVerifications.priceAtTip),
         isNotNull(tips.ticker),
-        isNotNull(tips.market),
         isNotNull(tips.sentiment),
         ne(tips.sentiment, "neutral")
       )
@@ -133,13 +128,11 @@ async function fetchPendingTargets(): Promise<PendingTarget[]> {
       priceAtTip: string;
       targetPrice: string;
       ticker: string;
-      market: "TW" | "US" | "CRYPTO";
       sentiment: "bullish" | "bearish";
     } =>
       r.priceAtTip !== null &&
       r.targetPrice !== null &&
       r.ticker !== null &&
-      r.market !== null &&
       r.sentiment !== null &&
       r.sentiment !== "neutral"
   ) as PendingTarget[];
@@ -149,7 +142,7 @@ async function fetchPendingTargets(): Promise<PendingTarget[]> {
 
 async function processTarget(row: PendingTarget): Promise<void> {
   const {
-    verificationId, ticker, market, sentiment,
+    verificationId, ticker, sentiment,
     priceAtTip: priceAtTipStr, targetPrice: targetPriceStr, createdAt,
   } = row;
 
@@ -161,7 +154,7 @@ async function processTarget(row: PendingTarget): Promise<void> {
     return;
   }
 
-  const currentPrice = await fetchCurrentPrice(ticker, market);
+  const currentPrice = await fetchCurrentPrice(ticker);
   if (currentPrice === null) {
     console.warn(`  ✗ ${ticker} — price fetch failed, will retry tomorrow`);
     return;
@@ -193,7 +186,6 @@ async function processTarget(row: PendingTarget): Promise<void> {
   try {
     const text = buildHitMessage({
       ticker,
-      market,
       sentiment,
       targetPrice,
       priceAtCheck: currentPrice,

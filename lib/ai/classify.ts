@@ -11,10 +11,10 @@ export const PROMPT_VERSION = "classify-v1";
 // ─── Response schema ──────────────────────────────────────────────────────────
 
 const tickerSchema = z.object({
-  /** Raw symbol as the AI understood it — T7 resolver canonicalises it later */
-  symbol: z.string().min(1).max(30),
+  /** Taiwan stock code (4-6 digits) as the AI understood it — resolver canonicalises later */
+  symbol: z.string().min(1).max(10),
   sentiment: z.enum(["bullish", "bearish", "neutral"]),
-  /** Target price in the tip's native currency, if mentioned */
+  /** Target price in TWD, if mentioned */
   target_price: z.number().positive().optional(),
 });
 
@@ -25,15 +25,15 @@ export const classifySchema = z.discriminatedUnion("is_tip", [
   }),
   z.object({
     is_tip: z.literal(true),
-    /** Primary market of the tip */
-    market: z.enum(["TW", "US", "CRYPTO"]),
+    /** Always "TW" — the system is Taiwan-only */
+    market: z.literal("TW"),
     /** Overall directional sentiment of the tip */
     sentiment: z.enum(["bullish", "bearish", "neutral"]),
     /** One-line summary in Traditional Chinese, max 100 chars */
     summary: z.string().max(200),
     /** How confident the AI is this is a real, actionable tip (0–100) */
     confidence: z.number().int().min(0).max(100),
-    /** All tickers explicitly or clearly implied by the message */
+    /** All Taiwan stock codes explicitly or clearly implied by the message */
     tickers: z.array(tickerSchema).min(1).max(20),
   }),
 ]);
@@ -56,30 +56,30 @@ export interface ClassifyMedia {
 
 // ─── Prompt ───────────────────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `你是一個交易情報分析師。分析以下 Telegram 訊息，判斷是否包含有效的交易建議。
+const SYSTEM_PROMPT = `你是一個台股交易情報分析師。分析以下 Telegram 訊息，判斷是否包含有效的台股交易建議。
 
-【如果是交易情報】回覆此 JSON（不含其他文字）：
+【重要前提】本系統只處理台股（上市 + 上櫃），非台股內容一律回覆 is_tip: false。
+
+【如果是台股交易情報】回覆此 JSON（不含其他文字）：
 {
   "is_tip": true,
-  "market": "TW" | "US" | "CRYPTO",
+  "market": "TW",
   "sentiment": "bullish" | "bearish" | "neutral",
   "summary": "一句話摘要（繁體中文，100字以內）",
   "confidence": 整數0到100,
   "tickers": [
-    { "symbol": "股票代碼", "sentiment": "bullish"|"bearish"|"neutral", "target_price": 目標價（可省略）}
+    { "symbol": "4位數字代碼", "sentiment": "bullish"|"bearish"|"neutral", "target_price": 目標價（可省略）}
   ]
 }
 
 【欄位說明】
-- market: TW=台灣股市(上市+上櫃), US=美股, CRYPTO=加密貨幣
+- market: 固定為 "TW"
 - sentiment: bullish=看多, bearish=看空, neutral=中性觀察
 - confidence: 判斷這是明確可行情報的信心，不確定則給低分
-- tickers.symbol:
-  - 台股: 直接用4位數字代碼，例如 "2330"（不加 .TW）
-  - 美股: 用大寫英文代碼，例如 "AAPL"、"NVDA"
-  - 加密: 大寫符號，例如 "BTC"、"ETH"
+- tickers.symbol: 台股 4-6 位數字代碼，例如 "2330"、"6451"（不加 .TW 後綴）
+- target_price: 新台幣目標價，若原訊息無提及則省略此欄位
 
-【如果不是交易情報】（一般閒聊、單純新聞、無明確方向建議）：
+【如果不是台股情報】（一般閒聊、純新聞、無方向建議、美股、加密貨幣等）：
 { "is_tip": false, "reason": "原因說明" }
 
 只回覆 JSON，不加任何說明文字。`;
