@@ -6,6 +6,7 @@ import { createSupabaseBrowserClient } from "@/lib/auth/client";
 export default function SignupPage() {
   const [inviteCode, setInviteCode] = useState("");
   const [email, setEmail] = useState("");
+  const [telegramId, setTelegramId] = useState("");
   const [status, setStatus] = useState<
     "idle" | "validating" | "loading" | "sent" | "error"
   >("idle");
@@ -33,7 +34,9 @@ export default function SignupPage() {
     setStatus("loading");
 
     const supabase = createSupabaseBrowserClient();
-    const redirectTo = `${window.location.origin}/auth/callback?invite_code=${encodeURIComponent(inviteCode)}`;
+    const params = new URLSearchParams({ invite_code: inviteCode });
+    if (telegramId.trim()) params.set("telegram_id", telegramId.trim());
+    const redirectTo = `${window.location.origin}/auth/callback?${params.toString()}`;
 
     const { error } = await supabase.auth.signInWithOtp({
       email,
@@ -124,6 +127,31 @@ export default function SignupPage() {
               fontSize: "0.875rem",
             }}
           />
+
+          <label
+            htmlFor="telegram-id"
+            style={{ fontSize: "0.875rem", fontWeight: 500 }}
+          >
+            Telegram User ID
+          </label>
+          <input
+            id="telegram-id"
+            type="text"
+            inputMode="numeric"
+            value={telegramId}
+            onChange={(e) => setTelegramId(e.target.value.replace(/\D/g, ""))}
+            placeholder="123456789"
+            style={{
+              padding: "0.5rem 0.75rem",
+              border: "1px solid #d1d5db",
+              borderRadius: "0.375rem",
+              fontSize: "0.875rem",
+              fontFamily: "monospace",
+            }}
+          />
+          <p style={{ fontSize: "0.7rem", color: "#6b7280", marginTop: "-0.5rem" }}>
+            傳 <code>/start</code> 給 <a href="https://t.me/userinfobot" target="_blank" rel="noreferrer" style={{ color: "#2563eb" }}>@userinfobot</a> 取得你的 ID
+          </p>
 
           {status === "error" && (
             <p style={{ color: "#dc2626", fontSize: "0.75rem" }}>{errorMsg}</p>
