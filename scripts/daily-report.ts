@@ -31,7 +31,9 @@ import { tips } from "@/lib/db/schema/tips";
 import {
   fetchDailyOHLCV,
   fetchInstitutionalInvestors,
+  fetchWatchList,
 } from "@/lib/finmind/client";
+import { detectInstitutionalAnomaly } from "@/lib/chip-analysis/detector";
 import { sendMessage } from "@/lib/telegram/client";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
@@ -81,6 +83,16 @@ interface EnrichedRow extends PortfolioRow {
   institutionalForeign: number;    // 外資 net 張
   institutionalTrust: number;      // 投信 net 張
   institutionalDealer: number;     // 自營商 net 張
+  // ── Chip anomaly flags (merged from T5) ────────────────────────────────
+  watchListReason: string | null;  // 注意股/處置股原因，null = 未列管
+  instAnomaly: { direction: "buy" | "sell"; todayLots: number; avgLots: number; multiplier: number } | null;
+}
+
+interface WatchListEntry {
+  stockId: string;
+  stockName: string;
+  reason: string;
+  date: string;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
@@ -191,7 +203,8 @@ async function fetchIndustry(stockId: string): Promise<string | null> {
  */
 async function enrichHolding(
   row: PortfolioRow,
-  todayStr: string
+  todayStr: string,
+  watchList: WatchListEntry[]
 ): Promise<EnrichedRow> {
   const stockId = stripSuffix(row.symbol);
   const costBasis = row.sharesLots * 1000 * row.avgCost;
@@ -235,27 +248,62 @@ async function enrichHolding(
     dailyChangePct = ((currentPrice - prevClose) / prevClose) * 100;
   }
 
-  // Fetch institutional investors (start from today)
-  const instData = await fetchInstitutionalInvestors(stockId, todayStr);
+  // Fetch institutional investors for the past ~30 days so we have both today
+  // (for display) and a 20-day baseline (for anomaly detection).
+  const instStart = new Date();
+  instStart.setDate(instStart.getDate() - 30);
+  const instStartStr = instStart.toISOString().slice(0, 10);
+  const instData = await fetchInstitutionalInvestors(stockId, instStartStr);
   await sleep(FINMIND_SLEEP_MS);
 
-  // Filter to today's records only
-  const todayInst = (instData ?? []).filter((r) => r.date === todayStr);
-
-  let foreignNet = 0;
-  let trustNet = 0;
-  let dealerNet = 0;
-
-  for (const r of todayInst) {
+  // Aggregate institutional flow per day (shares, not 張)
+  const byDate = new Map<string, { foreign: number; trust: number; dealer: number }>();
+  for (const r of instData ?? []) {
+    const entry = byDate.get(r.date) ?? { foreign: 0, trust: 0, dealer: 0 };
     const net = r.buy - r.sell;
     if (r.name === "Foreign_Investor" || r.name === "Foreign_Dealer_Self") {
-      foreignNet += net;
+      entry.foreign += net;
     } else if (r.name === "Investment_Trust") {
-      trustNet += net;
+      entry.trust += net;
     } else if (r.name === "Dealer_self" || r.name === "Dealer_Hedging") {
-      dealerNet += net;
+      entry.dealer += net;
     }
+    byDate.set(r.date, entry);
   }
+
+  const todayEntry = byDate.get(todayStr) ?? { foreign: 0, trust: 0, dealer: 0 };
+  const foreignNet = todayEntry.foreign;
+  const trustNet = todayEntry.trust;
+  const dealerNet = todayEntry.dealer;
+
+  // Build detector input: sorted-by-date array with net-shares per faction
+  const detectorRows = Array.from(byDate.entries())
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([date, e]) => ({
+      date,
+      netSharesForeign: e.foreign,
+      netSharesTrust: e.trust,
+      netSharesDealer: e.dealer,
+    }));
+
+  const detection = detectInstitutionalAnomaly(detectorRows);
+
+  let instAnomaly: EnrichedRow["instAnomaly"] = null;
+  if (detection.isAnomaly && detection.direction) {
+    const absAvg = Math.abs(detection.avgNetLots);
+    const absToday = Math.abs(detection.todayNetLots);
+    const multiplier = absAvg > 0 ? absToday / absAvg : 0;
+    instAnomaly = {
+      direction: detection.direction,
+      todayLots: detection.todayNetLots,
+      avgLots: detection.avgNetLots,
+      multiplier,
+    };
+  }
+
+  // Watch list lookup — O(N) linear scan; watchList is usually < 100 entries
+  const watchEntry = watchList.find((w) => w.stockId === stockId);
+  const watchListReason = watchEntry?.reason ?? null;
 
   // Convert shares → 張 (round to integer)
   const toZhang = (shares: number) => Math.round(shares / 1000);
@@ -278,6 +326,8 @@ async function enrichHolding(
     institutionalForeign: toZhang(foreignNet),
     institutionalTrust: toZhang(trustNet),
     institutionalDealer: toZhang(dealerNet),
+    watchListReason,
+    instAnomaly,
   };
 }
 
@@ -395,6 +445,20 @@ function buildReportMessage(
       );
       lines.push(`  合計 ${fmtSign(instTotal)}`);
     }
+
+    // Chip anomaly flags (merged from T5 — was sent separately at 18:00)
+    if (r.watchListReason) {
+      lines.push(``);
+      lines.push(`⚠️ <b>列入注意股/處置股</b>：${r.watchListReason}`);
+    }
+    if (r.instAnomaly) {
+      const label = r.instAnomaly.direction === "buy" ? "異常買超" : "異常賣超";
+      const ratio = r.instAnomaly.multiplier.toFixed(1);
+      lines.push(``);
+      lines.push(
+        `🚨 <b>法人${label}</b>：${fmtSign(r.instAnomaly.todayLots)} 張（20 日均 ${fmtSign(r.instAnomaly.avgLots)}，約 ${ratio} 倍）`
+      );
+    }
   });
 
   lines.push(``);
@@ -452,6 +516,12 @@ async function main() {
 
   console.log(`Trading day confirmed for ${today}`);
 
+  // ── Fetch watch list once, shared across all users/holdings ──────────────
+  const watchListData = await fetchWatchList();
+  await sleep(FINMIND_SLEEP_MS);
+  const watchList: WatchListEntry[] = watchListData ?? [];
+  console.log(`Watch list: ${watchList.length} stocks flagged`);
+
   // ── Per-user loop ────────────────────────────────────────────────────────
   for (const userId of userIds) {
     console.log(`\nProcessing user: ${userId}`);
@@ -474,7 +544,7 @@ async function main() {
     const enriched: EnrichedRow[] = [];
     for (const h of userHoldings) {
       console.log(`    Enriching ${h.symbol}...`);
-      const row = await enrichHolding(h, today);
+      const row = await enrichHolding(h, today, watchList);
       enriched.push(row);
       console.log(
         `    → close=${row.currentPrice ?? "N/A"} dailyPct=${row.dailyChangePct?.toFixed(2) ?? "N/A"}%`
