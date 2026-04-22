@@ -13,8 +13,9 @@
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
-import { eq, and } from "drizzle-orm";
+import { eq, and, isNull, gt } from "drizzle-orm";
 import { db } from "@/lib/db/client";
+import { createSupabaseAdminClient } from "@/lib/auth/admin";
 import { userProfiles, inviteCodes } from "@/lib/db/schema/users";
 import { rawMessages } from "@/lib/db/schema/raw-messages";
 import { aiClassifications } from "@/lib/db/schema/classifications";
@@ -67,15 +68,32 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
   const telegramUserId = msg.from?.id;
   if (!telegramUserId) return;
 
+  const text = rawText.trim();
+
+  // /start <code> — new user invite redemption, runs BEFORE allowlist check
+  const startMatch = /^\/start(?:@\S+)?(?:\s+(\S+))?$/i.exec(text);
+  if (startMatch !== null) {
+    const code = startMatch[1]?.toUpperCase();
+    if (code) {
+      await handleInviteRedemption(code, telegramUserId, msg.chat.id);
+      return;
+    }
+  }
+
   // Allowlist check — also fetch role for command auth
   const [profile] = await db
     .select({ id: userProfiles.id, role: userProfiles.role })
     .from(userProfiles)
     .where(eq(userProfiles.telegramId, telegramUserId))
     .limit(1);
-  if (!profile) return;
-
-  const text = rawText.trim();
+  if (!profile) {
+    await sendMessage({
+      chat_id: msg.chat.id,
+      text: "👋 你尚未加入白名單。\n\n請向管理員申請邀請連結，點擊連結即可自動加入。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
 
   // T14: intercept bot commands — do not persist to rawMessages
   if (text.startsWith("/")) {
@@ -146,20 +164,19 @@ async function handleCommand(
       }
 
       const code = await createInviteCode(profile.id);
-      const appUrl =
-        process.env["NEXT_PUBLIC_APP_URL"] ?? "http://localhost:3000";
+      const botLink = `https://t.me/FF_tradinginfo_bot?start=${code}`;
       await sendMessage({
         chat_id: chatId,
         text: [
-          "🎟 <b>邀請碼已產生</b>",
+          "🎟 <b>邀請連結已產生</b>",
           "",
           `<b>邀請碼：</b><code>${code}</code>`,
           "<b>有效期限：</b>7 天",
           "",
-          "<b>邀請連結：</b>",
-          `${appUrl}/auth/signup?invite_code=${code}`,
+          "<b>傳給對方這個連結：</b>",
+          botLink,
           "",
-          "請直接將連結傳給被邀請人。",
+          "對方點擊後在 Telegram 開啟，即可自動加入，無需填寫任何資料。",
         ].join("\n"),
         parse_mode: "HTML",
       });
@@ -213,6 +230,108 @@ async function handleCommand(
     await sendMessage({
       chat_id: chatId,
       text: "⚠️ 指令執行失敗，請稍後再試。",
+      parse_mode: "HTML",
+    });
+  }
+}
+
+// ─── T14: Telegram invite redemption (/start CODE) ───────────────────────────
+
+async function handleInviteRedemption(
+  code: string,
+  telegramUserId: number,
+  chatId: number
+): Promise<void> {
+  // Already a member?
+  const [existing] = await db
+    .select({ id: userProfiles.id })
+    .from(userProfiles)
+    .where(eq(userProfiles.telegramId, telegramUserId))
+    .limit(1);
+
+  if (existing) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "✅ 你已經是成員了！輸入 /help 查看可用指令。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const now = new Date();
+
+  // Validate invite code
+  const [invite] = await db
+    .select({ id: inviteCodes.id, createdBy: inviteCodes.createdBy })
+    .from(inviteCodes)
+    .where(
+      and(
+        eq(inviteCodes.code, code),
+        eq(inviteCodes.isRevoked, false),
+        isNull(inviteCodes.usedAt),
+        gt(inviteCodes.expiresAt, now)
+      )
+    )
+    .limit(1);
+
+  if (!invite) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 邀請連結無效、已過期或已被使用。\n請向管理員申請新的邀請連結。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  try {
+    // Create a ghost Supabase auth user to satisfy the FK constraint.
+    // Telegram-only users never log in via the web, but the FK requires
+    // a matching auth.users row.
+    const admin = createSupabaseAdminClient();
+    const ghostEmail = `tg_${telegramUserId}@telegram.local`;
+    const { data: authData, error: authErr } = await admin.auth.admin.createUser({
+      email: ghostEmail,
+      email_confirm: true,
+      user_metadata: { telegram_id: telegramUserId, signup_via: "telegram_invite" },
+    });
+
+    if (authErr || !authData.user) {
+      throw new Error(`auth_create_failed: ${authErr?.message ?? "unknown"}`);
+    }
+
+    const userId = authData.user.id;
+
+    await db.transaction(async (tx) => {
+      await tx.insert(userProfiles).values({
+        id: userId,
+        telegramId: telegramUserId,
+        role: "member",
+        invitedBy: invite.createdBy,
+      }).onConflictDoNothing();
+
+      await tx
+        .update(inviteCodes)
+        .set({ usedBy: userId, usedAt: now })
+        .where(and(eq(inviteCodes.id, invite.id), isNull(inviteCodes.usedAt)));
+    });
+
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        "🎉 <b>歡迎加入！</b>",
+        "",
+        "你已成功加入，現在可以直接傳送交易情報。",
+        "AI 會自動分類，你確認後記錄進資料庫。",
+        "",
+        "輸入 /help 查看說明。",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+  } catch (err) {
+    console.error("[webhook] invite redemption error:", err);
+    await sendMessage({
+      chat_id: chatId,
+      text: "⚠️ 加入失敗，請稍後再試或聯絡管理員。",
       parse_mode: "HTML",
     });
   }
