@@ -33,6 +33,7 @@ import { parseHoldingsPhoto } from "@/lib/holdings/import-from-photo";
 import { resolveTicker } from "@/lib/ticker/resolver";
 import { holdings as holdingsTable } from "@/lib/db/schema/holdings";
 import { priceAlerts } from "@/lib/db/schema/price-alerts";
+import { ensureDefaultAlert, DEFAULT_UP_PCT, DEFAULT_DOWN_PCT } from "@/lib/price-alerts/defaults";
 
 const MAX_TEXT_CHARS = 2000;
 const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -553,12 +554,36 @@ async function handleBuy(
 
   try {
     const result = await buyHolding({ userId, symbol, sharesLots, price });
+
+    // Convenience: auto-create ±5% alert if user has none for this symbol.
+    // ON CONFLICT DO NOTHING preserves any existing /alert customisation.
+    // Determine whether this call actually created a new alert so we can
+    // tell the user either "default alert added" or stay silent.
+    const existingAlert = await db
+      .select({ id: priceAlerts.id })
+      .from(priceAlerts)
+      .where(
+        and(eq(priceAlerts.userId, userId), eq(priceAlerts.symbol, symbol))
+      )
+      .limit(1);
+    const hadAlertBefore = existingAlert.length > 0;
+    await ensureDefaultAlert(userId, symbol);
+
+    const lines = [
+      `✅ 已記錄 買入 ${rawSymbol} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
+      `持股更新為 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`,
+    ];
+    if (!hadAlertBefore) {
+      lines.push(
+        "",
+        `🔔 已自動設定預設警示：漲 ≥ ${DEFAULT_UP_PCT}% 或跌 ≤ ${DEFAULT_DOWN_PCT}% 時通知`,
+        `   可用 <code>/alert ${rawSymbol} ...</code> 自訂，<code>/unalert ${rawSymbol}</code> 關閉`
+      );
+    }
+
     await sendMessage({
       chat_id: chatId,
-      text: [
-        `✅ 已記錄 買入 ${rawSymbol} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
-        `持股更新為 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`,
-      ].join("\n"),
+      text: lines.join("\n"),
       parse_mode: "HTML",
     });
   } catch (err) {
@@ -1505,6 +1530,7 @@ async function handleImportCallback(
 
   // All resolved — write atomically. If anything fails, rollback and no rows are written.
   let successCount = 0;
+  let defaultAlertCount = 0;
   const errors: string[] = [];
   try {
     for (const r of resolved) {
@@ -1516,6 +1542,24 @@ async function handleImportCallback(
         note: "截圖批次匯入",
       });
       successCount++;
+
+      // Seed default ±5% alert for each newly imported holding.
+      // ON CONFLICT DO NOTHING preserves any existing customisations.
+      // Check BEFORE to count how many defaults actually got created.
+      const existing = await db
+        .select({ id: priceAlerts.id })
+        .from(priceAlerts)
+        .where(
+          and(
+            eq(priceAlerts.userId, pending.userId),
+            eq(priceAlerts.symbol, r.symbol)
+          )
+        )
+        .limit(1);
+      if (existing.length === 0) {
+        await ensureDefaultAlert(pending.userId, r.symbol);
+        defaultAlertCount++;
+      }
     }
   } catch (err) {
     console.error("[webhook] import confirm transaction error:", err);
@@ -1533,6 +1577,12 @@ async function handleImportCallback(
   const resultLines = [`✅ <b>持股匯入完成</b>，成功 ${successCount} 筆`];
   if (errors.length > 0) {
     resultLines.push(`⚠️ ${errors.join("；")}`);
+  }
+  if (defaultAlertCount > 0) {
+    resultLines.push(
+      `🔔 已自動為 ${defaultAlertCount} 檔設定預設警示（漲 ≥ ${DEFAULT_UP_PCT}% 或跌 ≤ ${DEFAULT_DOWN_PCT}% 通知）`,
+      `   用 <code>/alerts</code> 檢視 ／ <code>/alert 代號 ...</code> 自訂 ／ <code>/unalert 代號</code> 關閉`
+    );
   }
   resultLines.push("\n輸入 /portfolio 查看最新持股");
 
