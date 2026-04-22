@@ -69,6 +69,6 @@ export const config = {
      * Without the `(/|$)` a path like `/authentic` would also be excluded — we
      * use word-boundary semantics instead.
      */
-    "/((?!auth(/|$)|api/telegram/webhook|_next/static|_next/image|favicon\\.ico|robots\\.txt).*)",
+    "/((?!auth(?:/|$)|api/telegram/webhook|_next/static|_next/image|favicon\\.ico|robots\\.txt).*)",
   ],
 };
