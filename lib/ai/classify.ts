@@ -50,6 +50,11 @@ export interface ClassifyOutput {
   rawResponse: unknown;
 }
 
+export interface ClassifyMedia {
+  type: "photo" | "pdf";
+  base64: string;
+}
+
 // ─── Prompt ───────────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `你是一個交易情報分析師。分析以下 Telegram 訊息，判斷是否包含有效的交易建議。
@@ -94,20 +99,43 @@ function getClient(): Anthropic {
 }
 
 /**
- * Classifies a single message text using Claude.
+ * Classifies a single message using Claude.
+ * Optionally accepts a photo (base64 JPEG) or PDF for vision/document analysis.
  * Throws on API or validation errors — caller decides retry strategy.
  */
 export async function classifyMessage(
   messageText: string,
-  model: string = DEFAULT_MODEL
+  model: string = DEFAULT_MODEL,
+  media?: ClassifyMedia
 ): Promise<ClassifyOutput> {
   const client = getClient();
+
+  // Build content parts — prepend media before text if present
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const parts: any[] = [];
+
+  if (media?.type === "photo") {
+    parts.push({
+      type: "image",
+      source: { type: "base64", media_type: "image/jpeg", data: media.base64 },
+    });
+  } else if (media?.type === "pdf") {
+    parts.push({
+      type: "document",
+      source: { type: "base64", media_type: "application/pdf", data: media.base64 },
+    });
+  }
+
+  parts.push({
+    type: "text",
+    text: messageText || "請分析上面的圖片/文件中的交易情報。",
+  });
 
   const response = await client.messages.create({
     model,
     max_tokens: 1024,
     system: SYSTEM_PROMPT,
-    messages: [{ role: "user", content: messageText }],
+    messages: [{ role: "user", content: parts }],
   });
 
   const inputTokens = response.usage.input_tokens;

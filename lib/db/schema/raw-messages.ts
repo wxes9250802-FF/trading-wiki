@@ -58,6 +58,12 @@ export const rawMessages = pgTable("raw_messages", {
   // True if message was >2000 chars and truncated before storage
   truncated: boolean("truncated").default(false).notNull(),
 
+  // Optional media attachment stored for AI classification
+  // 'photo' = Telegram photo, 'pdf' = PDF document
+  mediaType: text("media_type"),
+  // Telegram file_id — stable, used to download the file during classification
+  mediaFileId: text("media_file_id"),
+
   // Set by T6 worker on successful classification
   aiTipId: uuid("ai_tip_id"),
 

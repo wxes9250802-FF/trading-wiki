@@ -11,6 +11,22 @@ export interface TelegramUpdate {
   callback_query?: TelegramCallbackQuery; // handled by T8
 }
 
+export interface TelegramPhotoSize {
+  file_id: string;
+  file_unique_id: string;
+  width: number;
+  height: number;
+  file_size?: number;
+}
+
+export interface TelegramDocument {
+  file_id: string;
+  file_unique_id: string;
+  file_name?: string;
+  mime_type?: string;
+  file_size?: number;
+}
+
 export interface TelegramMessage {
   message_id: number;
   from?: TelegramUser; // absent for channel posts
@@ -21,6 +37,10 @@ export interface TelegramMessage {
   text?: string;
   /** Present for media messages with a caption (photo + text, etc.) */
   caption?: string;
+  /** Array of photo sizes (smallest → largest). Use last element for best quality. */
+  photo?: TelegramPhotoSize[];
+  /** Present for file/document messages (including PDFs) */
+  document?: TelegramDocument;
 }
 
 export interface TelegramUser {

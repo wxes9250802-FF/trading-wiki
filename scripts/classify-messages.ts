@@ -33,10 +33,33 @@ import { tipTickers } from "@/lib/db/schema/classifications";
 import { aiClassifications } from "@/lib/db/schema/classifications";
 import { tipVerifications } from "@/lib/db/schema/verifications";
 
-import { classifyMessage, DEFAULT_MODEL, PROMPT_VERSION } from "@/lib/ai/classify";
+import { classifyMessage, DEFAULT_MODEL, PROMPT_VERSION, type ClassifyMedia } from "@/lib/ai/classify";
 import { fetchCurrentPrice } from "@/lib/price/client";
 import { sendMessage } from "@/lib/telegram/client";
 import type { RawMessage } from "@/lib/db/schema/raw-messages";
+
+// ─── Telegram file download ───────────────────────────────────────────────────
+
+async function downloadTelegramFile(fileId: string): Promise<string | null> {
+  const token = process.env["TELEGRAM_BOT_TOKEN"];
+  if (!token) return null;
+
+  try {
+    const metaRes = await fetch(
+      `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`
+    );
+    const meta = (await metaRes.json()) as { ok: boolean; result?: { file_path: string } };
+    if (!meta.ok || !meta.result?.file_path) return null;
+
+    const fileRes = await fetch(
+      `https://api.telegram.org/file/bot${token}/${meta.result.file_path}`
+    );
+    const buffer = await fileRes.arrayBuffer();
+    return Buffer.from(buffer).toString("base64");
+  } catch {
+    return null;
+  }
+}
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -178,9 +201,19 @@ async function processMessage(msg: RawMessage): Promise<void> {
 
   let classifyError: string | null = null;
 
+  // Download media attachment if present
+  let media: ClassifyMedia | undefined;
+  if (msg.mediaFileId && (msg.mediaType === "photo" || msg.mediaType === "pdf")) {
+    const base64 = await downloadTelegramFile(msg.mediaFileId);
+    if (base64) {
+      media = { type: msg.mediaType as "photo" | "pdf", base64 };
+      console.log(`    → downloaded ${msg.mediaType} (${msg.mediaFileId.slice(0, 12)}...)`);
+    }
+  }
+
   try {
     const { result, model, inputTokens, outputTokens, rawResponse } =
-      await classifyMessage(msg.messageText);
+      await classifyMessage(msg.messageText, DEFAULT_MODEL, media);
 
     await db.transaction(async (tx) => {
       if (result.is_tip) {
