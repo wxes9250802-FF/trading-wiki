@@ -10,8 +10,8 @@
  *   bullish tip → current price >= target_price
  *   bearish tip → current price <= target_price
  *
- * When hit: marks result='hit', records priceAtCheck, and sends the original
- * user a Telegram push notification.
+ * When hit: marks result='hit', records priceAtCheck, and broadcasts a
+ * Telegram push notification to ALL registered bot users.
  *
  * Neutral tips and tips without a target_price are skipped entirely.
  */
@@ -25,6 +25,7 @@ import { eq, and, isNotNull, ne } from "drizzle-orm";
 
 import { tips } from "@/lib/db/schema/tips";
 import { tipVerifications } from "@/lib/db/schema/verifications";
+import { userProfiles } from "@/lib/db/schema/users";
 
 import { fetchCurrentPrice } from "@/lib/price/client";
 import { sendMessage } from "@/lib/telegram/client";
@@ -188,7 +189,7 @@ async function processTarget(row: PendingTarget): Promise<void> {
     })
     .where(eq(tipVerifications.id, verificationId));
 
-  // Notify user
+  // Broadcast to all registered users with a telegram_id
   try {
     const text = buildHitMessage({
       ticker,
@@ -200,13 +201,25 @@ async function processTarget(row: PendingTarget): Promise<void> {
       daysElapsed,
     });
 
-    await sendMessage({
-      chat_id: row.telegramChatId,
-      text,
-      parse_mode: "HTML",
-    });
+    const allUsers = await db
+      .select({ telegramId: userProfiles.telegramId })
+      .from(userProfiles)
+      .where(isNotNull(userProfiles.telegramId));
+
+    for (const user of allUsers) {
+      if (!user.telegramId) continue;
+      await sendMessage({
+        chat_id: user.telegramId,
+        text,
+        parse_mode: "HTML",
+      }).catch((err) => {
+        console.warn(`  ⚠ notify user ${user.telegramId} failed: ${String(err)}`);
+      });
+    }
+
+    console.log(`  → notified ${allUsers.length} user(s)`);
   } catch (notifyErr) {
-    console.warn(`  ⚠ notification failed: ${String(notifyErr)}`);
+    console.warn(`  ⚠ broadcast failed: ${String(notifyErr)}`);
   }
 }
 
