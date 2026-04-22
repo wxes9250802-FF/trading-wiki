@@ -201,6 +201,136 @@ export async function fetchDailyOHLCV(
   }
 }
 
+// ─── TWSE Watch/Punish List ───────────────────────────────────────────────────
+
+/**
+ * Raw record from TWSE /v1/announcement/notice
+ * Number "0" with empty Code means "no stocks on the notice list today".
+ */
+interface TwseNoticeRecord {
+  Number: string;
+  Code: string;
+  Name: string;
+  TradingInfoForAttention: string;
+  Date: string;      // e.g. "1150416" (Republic of China era YYYMMDD)
+  ClosingPrice: string;
+  PE: string;
+  NumberOfAnnouncement: string;
+}
+
+/**
+ * Raw record from TWSE /v1/announcement/punish
+ */
+interface TwsePunishRecord {
+  Number: string;
+  Code: string;
+  Name: string;
+  Date: string;      // e.g. "1150416"
+  ReasonsOfDisposition: string;
+  DispositionMeasures: string; // e.g. "第一次處置"
+  DispositionPeriod: string;
+  NumberOfAnnouncement: string;
+  Detail: string;
+  LinkInformation: string;
+}
+
+export interface WatchListItem {
+  stockId: string;
+  stockName: string;
+  /** 「注意」「處置」「變更交易方法」等 */
+  reason: string;
+  /** Announcement date in "YYYY-MM-DD" format */
+  date: string;
+}
+
+/**
+ * Convert a Republic-of-China-era date string (e.g. "1150416") to ISO-8601.
+ * ROC year + 1911 = Gregorian year.
+ * Returns null if the string cannot be parsed.
+ */
+function rocDateToIso(roc: string): string | null {
+  // Format: YYYMMDD (3-digit year) or possibly YYMMDD
+  const clean = roc.trim();
+  if (clean.length < 7) return null;
+
+  // Last 4 chars are MMDD, leading part is year
+  const mmdd = clean.slice(-4);
+  const yearPart = clean.slice(0, clean.length - 4);
+  const rocYear = parseInt(yearPart, 10);
+  if (isNaN(rocYear)) return null;
+
+  const gregorianYear = rocYear + 1911;
+  const mm = mmdd.slice(0, 2);
+  const dd = mmdd.slice(2, 4);
+  return `${gregorianYear}-${mm}-${dd}`;
+}
+
+/**
+ * Fetches the current notice and punishment stock lists from TWSE.
+ * Uses two free, keyless TWSE OpenAPI endpoints:
+ *   - https://openapi.twse.com.tw/v1/announcement/notice   (注意股)
+ *   - https://openapi.twse.com.tw/v1/announcement/punish   (處置股)
+ *
+ * Returns the combined list, deduped by stockId (punish overrides notice).
+ * Returns null only if BOTH endpoints fail; returns [] on a non-watch day.
+ */
+export async function fetchWatchList(): Promise<WatchListItem[] | null> {
+  const NOTICE_URL = "https://openapi.twse.com.tw/v1/announcement/notice";
+  const PUNISH_URL = "https://openapi.twse.com.tw/v1/announcement/punish";
+
+  let noticeItems: WatchListItem[] = [];
+  let punishItems: WatchListItem[] = [];
+  let noticeOk = false;
+  let punishOk = false;
+
+  // ── Notice stocks ──────────────────────────────────────────────────────────
+  try {
+    const res = await fetch(NOTICE_URL, { signal: AbortSignal.timeout(15_000) });
+    if (res.ok) {
+      const data = (await res.json()) as TwseNoticeRecord[];
+      noticeOk = true;
+      noticeItems = data
+        .filter((r) => r.Code && r.Code.trim() !== "")
+        .map((r) => ({
+          stockId: r.Code.trim(),
+          stockName: r.Name.trim(),
+          reason: r.TradingInfoForAttention?.trim() || "注意",
+          date: rocDateToIso(r.Date) ?? r.Date,
+        }));
+    }
+  } catch {
+    console.warn("[watchlist] TWSE notice endpoint failed");
+  }
+
+  // ── Punish stocks ──────────────────────────────────────────────────────────
+  try {
+    const res = await fetch(PUNISH_URL, { signal: AbortSignal.timeout(15_000) });
+    if (res.ok) {
+      const data = (await res.json()) as TwsePunishRecord[];
+      punishOk = true;
+      punishItems = data
+        .filter((r) => r.Code && r.Code.trim() !== "")
+        .map((r) => ({
+          stockId: r.Code.trim(),
+          stockName: r.Name.trim(),
+          reason: r.DispositionMeasures?.trim() || "處置",
+          date: rocDateToIso(r.Date) ?? r.Date,
+        }));
+    }
+  } catch {
+    console.warn("[watchlist] TWSE punish endpoint failed");
+  }
+
+  if (!noticeOk && !punishOk) return null;
+
+  // Merge: punish takes precedence over notice for the same stockId
+  const map = new Map<string, WatchListItem>();
+  for (const item of noticeItems) map.set(item.stockId, item);
+  for (const item of punishItems) map.set(item.stockId, item); // overwrite
+
+  return Array.from(map.values());
+}
+
 /**
  * Fetch institutional investor buy/sell data for a stock.
  * Designed for future T5 use — returns null on any error.
