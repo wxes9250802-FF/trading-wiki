@@ -8,3 +8,4 @@ export * from "./verifications";
 export * from "./classifications";
 export * from "./holdings";
 export * from "./pending-imports";
+export * from "./chip-alerts";
