@@ -661,11 +661,26 @@ async function handleSell(
       ? "持股已全數賣出"
       : `剩餘 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`;
 
+    // When fully sold out, also remove any price alert — user no longer
+    // holds it so the alert is noise. Partial sells keep the alert.
+    let alertRemovedNote = "";
+    if (result === null) {
+      const removed = await db
+        .delete(priceAlerts)
+        .where(
+          and(eq(priceAlerts.userId, userId), eq(priceAlerts.symbol, symbol))
+        )
+        .returning({ symbol: priceAlerts.symbol });
+      if (removed.length > 0) {
+        alertRemovedNote = `\n🔕 已同步移除此股警示`;
+      }
+    }
+
     await sendMessage({
       chat_id: chatId,
       text: [
         `✅ 已記錄 賣出 ${rawSymbol} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
-        afterText + pnlText,
+        afterText + pnlText + alertRemovedNote,
       ].join("\n"),
       parse_mode: "HTML",
     });
