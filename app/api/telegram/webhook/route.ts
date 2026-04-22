@@ -20,12 +20,18 @@ import { userProfiles, inviteCodes } from "@/lib/db/schema/users";
 import { rawMessages } from "@/lib/db/schema/raw-messages";
 import { aiClassifications, tipTickers } from "@/lib/db/schema/classifications";
 import { tips } from "@/lib/db/schema/tips";
+import { pendingImports } from "@/lib/db/schema/pending-imports";
+import type { PendingImportItem } from "@/lib/db/schema/pending-imports";
 import {
   answerCallbackQuery,
   editMessageReplyMarkup,
   sendMessage,
 } from "@/lib/telegram/client";
 import type { TelegramUpdate, TelegramCallbackQuery, TelegramMessage } from "@/lib/telegram/types";
+import { buyHolding, sellHolding, listPortfolio } from "@/lib/holdings/manager";
+import { parseHoldingsPhoto } from "@/lib/holdings/import-from-photo";
+import { resolveTicker } from "@/lib/ticker/resolver";
+import { holdings as holdingsTable } from "@/lib/db/schema/holdings";
 
 const MAX_TEXT_CHARS = 2000;
 const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -119,6 +125,22 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
       text: "👋 你尚未加入白名單。\n\n請向管理員申請邀請連結，點擊連結即可自動加入。",
       parse_mode: "HTML",
     });
+    return;
+  }
+
+  // Holdings import: photo with /import or /匯入 caption
+  const captionCommand = text.toLowerCase();
+  if (captionCommand === "/import" || captionCommand === "/匯入") {
+    const hasPhoto = !!(msg.photo?.length);
+    if (!hasPhoto) {
+      await sendMessage({
+        chat_id: msg.chat.id,
+        text: "❓ 請連同持股截圖一起傳送 /import",
+        parse_mode: "HTML",
+      });
+      return;
+    }
+    await handleImportPhoto(profile.id, msg.chat.id, msg.photo!);
     return;
   }
 
@@ -244,6 +266,12 @@ async function handleCommand(
           "/q 股票代號 — 查詢某支股票的所有情報",
           "/stats — 查看情報總覽統計",
           "/help — 顯示此說明",
+          "",
+          "📦 <b>持股管理：</b>",
+          "/buy 代號 張數 成本 — 買入，例如 <code>/buy 2330 10 985.5</code>",
+          "/sell 代號 張數 賣價 — 賣出，例如 <code>/sell 2330 5 1050</code>",
+          "/portfolio — 查看我的持股與損益",
+          "（傳圖時 caption 寫 /import — 截圖批次匯入）",
           "",
           "（管理員限定）",
           "/invite — 產生新邀請碼",
@@ -397,6 +425,21 @@ async function handleCommand(
       return;
     }
 
+    if (command === "/buy") {
+      await handleBuy(rawCommand, profile.id, chatId);
+      return;
+    }
+
+    if (command === "/sell") {
+      await handleSell(rawCommand, profile.id, chatId);
+      return;
+    }
+
+    if (command === "/portfolio") {
+      await handlePortfolio(profile.id, chatId);
+      return;
+    }
+
     // Unknown command
     await sendMessage({
       chat_id: chatId,
@@ -411,6 +454,402 @@ async function handleCommand(
       parse_mode: "HTML",
     });
   }
+}
+
+// ─── Holdings: /buy ───────────────────────────────────────────────────────────
+
+async function handleBuy(
+  rawCommand: string,
+  userId: string,
+  chatId: number
+): Promise<void> {
+  const parts = rawCommand.trim().split(/\s+/);
+  // /buy <symbol> <lots> <price>
+  const rawSymbol = parts[1] ?? "";
+  const rawLots = parts[2] ?? "";
+  const rawPrice = parts[3] ?? "";
+
+  if (!rawSymbol || !rawLots || !rawPrice) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❓ 用法：<code>/buy 代號 張數 成本</code>\n例如：<code>/buy 2330 10 985.5</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // 只接受台股 4-6 位代碼
+  if (!/^\d{4,6}$/.test(rawSymbol)) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 股票代號格式錯誤，請輸入 4-6 位台股代碼，例如 <code>2330</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const sharesLots = parseFloat(rawLots);
+  const price = parseFloat(rawPrice);
+
+  if (!isFinite(sharesLots) || sharesLots <= 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 張數必須大於 0",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  if (!isFinite(price) || price <= 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 成本價必須大於 0",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // 正規化 symbol：查 tickers 表
+  const ticker = await resolveTicker(rawSymbol);
+  const symbol = ticker?.symbol ?? `${rawSymbol}.TW`;
+  const displayName = ticker?.name ?? rawSymbol;
+
+  try {
+    const result = await buyHolding({ userId, symbol, sharesLots, price });
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        `✅ 已記錄 買入 ${rawSymbol} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
+        `持股更新為 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`,
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+  } catch (err) {
+    console.error("[webhook] buyHolding error:", err);
+    await sendMessage({
+      chat_id: chatId,
+      text: "⚠️ 買入記錄失敗，請稍後再試。",
+      parse_mode: "HTML",
+    });
+  }
+}
+
+// ─── Holdings: /sell ──────────────────────────────────────────────────────────
+
+async function handleSell(
+  rawCommand: string,
+  userId: string,
+  chatId: number
+): Promise<void> {
+  const parts = rawCommand.trim().split(/\s+/);
+  const rawSymbol = parts[1] ?? "";
+  const rawLots = parts[2] ?? "";
+  const rawPrice = parts[3] ?? "";
+
+  if (!rawSymbol || !rawLots || !rawPrice) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❓ 用法：<code>/sell 代號 張數 賣價</code>\n例如：<code>/sell 2330 5 1050</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  if (!/^\d{4,6}$/.test(rawSymbol)) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 股票代號格式錯誤，請輸入 4-6 位台股代碼，例如 <code>2330</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const sharesLots = parseFloat(rawLots);
+  const price = parseFloat(rawPrice);
+
+  if (!isFinite(sharesLots) || sharesLots <= 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 張數必須大於 0",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  if (!isFinite(price) || price <= 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 賣出價必須大於 0",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const ticker = await resolveTicker(rawSymbol);
+  const symbol = ticker?.symbol ?? `${rawSymbol}.TW`;
+  const displayName = ticker?.name ?? rawSymbol;
+
+  try {
+    // 先查均價（用於計算實現損益）
+    const [existing] = await db
+      .select({ avgCost: holdingsTable.avgCost })
+      .from(holdingsTable)
+      .where(and(eq(holdingsTable.userId, userId), eq(holdingsTable.symbol, symbol)))
+      .limit(1);
+
+    const avgCost = existing ? parseFloat(existing.avgCost) : null;
+
+    const result = await sellHolding({ userId, symbol, sharesLots, price });
+
+    // 計算實現損益
+    let pnlText = "";
+    if (avgCost !== null) {
+      const realizedPnl = (price - avgCost) * sharesLots * 1000;
+      const pnlPct = avgCost > 0 ? ((price - avgCost) / avgCost) * 100 : 0;
+      const sign = realizedPnl >= 0 ? "+" : "";
+      pnlText = `\n實現損益：${sign}NT$${realizedPnl.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}（${sign}${pnlPct.toFixed(1)}%）`;
+    }
+
+    const afterText = result === null
+      ? "持股已全數賣出"
+      : `剩餘 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`;
+
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        `✅ 已記錄 賣出 ${rawSymbol} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
+        afterText + pnlText,
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "";
+    if (msg.startsWith("NO_HOLDING:")) {
+      const sym = msg.split(":")[1] ?? rawSymbol;
+      await sendMessage({
+        chat_id: chatId,
+        text: `❌ 你沒有持有 ${sym} 的倉位`,
+        parse_mode: "HTML",
+      });
+    } else if (msg.startsWith("INSUFFICIENT:")) {
+      const parts2 = msg.split(":");
+      const sym = parts2[1] ?? rawSymbol;
+      const current = parts2[2] ?? "0";
+      await sendMessage({
+        chat_id: chatId,
+        text: `❌ 持有不足，${sym} 目前只有 ${current} 張`,
+        parse_mode: "HTML",
+      });
+    } else {
+      console.error("[webhook] sellHolding error:", err);
+      await sendMessage({
+        chat_id: chatId,
+        text: "⚠️ 賣出記錄失敗，請稍後再試。",
+        parse_mode: "HTML",
+      });
+    }
+  }
+}
+
+// ─── Holdings: /portfolio ─────────────────────────────────────────────────────
+
+async function handlePortfolio(userId: string, chatId: number): Promise<void> {
+  try {
+    const rows = await listPortfolio(userId);
+
+    if (rows.length === 0) {
+      await sendMessage({
+        chat_id: chatId,
+        text: "📭 你目前沒有持股，使用 /buy 開始記錄",
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
+    const lines: string[] = ["📊 <b>我的持股</b>", ""];
+
+    let totalCost = 0;
+    let totalValue = 0;
+    let allHavePrice = true;
+
+    rows.forEach((row, idx) => {
+      const shortSymbol = row.symbol.replace(/\.(TW|TWO)$/, "");
+      const lotsStr = row.sharesLots % 1 === 0
+        ? String(row.sharesLots)
+        : row.sharesLots.toFixed(1);
+
+      lines.push(`${idx + 1}. <b>${shortSymbol}</b> ${lotsStr} 張 @${row.avgCost.toFixed(2)}`);
+
+      if (row.currentPrice !== null && row.marketValue !== null && row.pnl !== null && row.pnlPct !== null) {
+        const sign = row.pnl >= 0 ? "+" : "";
+        const pnlSign = row.pnl >= 0 ? "+" : "";
+        lines.push(
+          `   現價 ${row.currentPrice.toFixed(2)}（${sign}${row.pnlPct.toFixed(2)}%）`
+        );
+        lines.push(
+          `   市值 NT$${row.marketValue.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}（${pnlSign}NT$${Math.abs(row.pnl).toLocaleString("zh-TW", { maximumFractionDigits: 0 })}）`
+        );
+        totalValue += row.marketValue;
+      } else {
+        lines.push("   現價 無法取得");
+        allHavePrice = false;
+        totalValue += row.costBasis; // fallback
+      }
+
+      totalCost += row.costBasis;
+      lines.push("");
+    });
+
+    lines.push("---");
+    lines.push(`總成本：NT$${totalCost.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}`);
+
+    if (allHavePrice) {
+      const totalPnl = totalValue - totalCost;
+      const totalPnlPct = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
+      const sign = totalPnl >= 0 ? "+" : "";
+      lines.push(`總市值：NT$${totalValue.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}`);
+      lines.push(
+        `未實現損益：${sign}NT$${Math.abs(totalPnl).toLocaleString("zh-TW", { maximumFractionDigits: 0 })}（${sign}${totalPnlPct.toFixed(2)}%）`
+      );
+    } else {
+      lines.push("（部分持股無法取得即時行情，損益計算不完整）");
+    }
+
+    await sendMessage({
+      chat_id: chatId,
+      text: lines.join("\n"),
+      parse_mode: "HTML",
+    });
+  } catch (err) {
+    console.error("[webhook] handlePortfolio error:", err);
+    await sendMessage({
+      chat_id: chatId,
+      text: "⚠️ 查詢持股失敗，請稍後再試。",
+      parse_mode: "HTML",
+    });
+  }
+}
+
+// ─── Holdings: photo import ───────────────────────────────────────────────────
+
+async function handleImportPhoto(
+  userId: string,
+  chatId: number,
+  photos: NonNullable<TelegramMessage["photo"]>
+): Promise<void> {
+  // Use the largest photo size
+  const largest = photos[photos.length - 1]!;
+  const fileId = largest.file_id;
+
+  // Download from Telegram
+  const token = process.env["TELEGRAM_BOT_TOKEN"];
+  if (!token) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "⚠️ Bot token 未設定，無法下載圖片。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  let base64: string;
+  try {
+    // Get file path
+    const fileRes = await fetch(
+      `https://api.telegram.org/bot${token}/getFile?file_id=${fileId}`
+    );
+    const fileData = (await fileRes.json()) as { ok: boolean; result?: { file_path?: string } };
+    if (!fileData.ok || !fileData.result?.file_path) {
+      throw new Error("getFile failed");
+    }
+
+    const filePath = fileData.result.file_path;
+    const dlRes = await fetch(
+      `https://api.telegram.org/file/bot${token}/${filePath}`
+    );
+    if (!dlRes.ok) throw new Error(`Download failed: ${dlRes.status}`);
+
+    const buffer = await dlRes.arrayBuffer();
+    base64 = Buffer.from(buffer).toString("base64");
+  } catch (err) {
+    console.error("[webhook] photo download error:", err);
+    await sendMessage({
+      chat_id: chatId,
+      text: "⚠️ 圖片下載失敗，請稍後再試。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Parse via Claude Vision
+  await sendMessage({
+    chat_id: chatId,
+    text: "🔍 正在解析持股截圖，請稍候…",
+    parse_mode: "HTML",
+  });
+
+  const rawItems = await parseHoldingsPhoto(base64);
+
+  if (!rawItems || rawItems.length === 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 無法從截圖辨識持股資料，請確認是台股券商 APP 的持股明細頁面。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Hard cap: AI hallucination defence. One screenshot realistically <= 30 items.
+  const items = rawItems.slice(0, 50);
+
+  // Remove any prior pending imports from this user — only one active at a time
+  await db.delete(pendingImports).where(eq(pendingImports.userId, userId));
+
+  // Store in pending_imports
+  const [pending] = await db
+    .insert(pendingImports)
+    .values({
+      userId,
+      payload: items as unknown as typeof pendingImports.$inferInsert["payload"],
+    })
+    .returning({ id: pendingImports.id });
+
+  if (!pending) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "⚠️ 暫存失敗，請稍後再試。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Format preview
+  const previewLines = items.map((item, idx) => {
+    const lotsStr = item.sharesLots % 1 === 0
+      ? String(item.sharesLots)
+      : item.sharesLots.toFixed(1);
+    return `${idx + 1}. ${item.symbol}　${lotsStr} 張　@${item.avgCost.toFixed(2)}`;
+  });
+
+  await sendMessage({
+    chat_id: chatId,
+    text: [
+      "📋 <b>從截圖辨識到以下持股，請確認是否匯入：</b>",
+      "",
+      ...previewLines,
+      "",
+      "請按下方按鈕確認或取消。",
+    ].join("\n"),
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ 確認匯入", callback_data: `import:${pending.id}:confirm` },
+          { text: "❌ 取消", callback_data: `import:${pending.id}:cancel` },
+        ],
+      ],
+    },
+  });
 }
 
 // ─── T14: Telegram invite redemption (/start CODE) ───────────────────────────
@@ -536,6 +975,12 @@ async function createInviteCode(createdBy: string): Promise<string> {
 async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> {
   const data = query.data ?? "";
 
+  // ── Import callback: "import:{uuid}:confirm" or "import:{uuid}:cancel" ───
+  if (data.startsWith("import:")) {
+    await handleImportCallback(query, data);
+    return;
+  }
+
   // Expected format: "conf:{uuid}" or "rejt:{uuid}"
   const colonIdx = data.indexOf(":");
   const action = colonIdx > 0 ? data.slice(0, colonIdx) : "";
@@ -612,6 +1057,182 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     text: confirmed
       ? "✅ <b>情報已確認</b>，已記錄進資料庫。"
       : "❌ <b>情報已駁回</b>，AI 分類結果已標記為不準確。",
+    parse_mode: "HTML",
+  });
+}
+
+// ─── Import callback handler ─────────────────────────────────────────────────
+
+async function handleImportCallback(
+  query: TelegramCallbackQuery,
+  data: string
+): Promise<void> {
+  // data format: "import:{uuid}:confirm" or "import:{uuid}:cancel"
+  const parts = data.split(":");
+  // parts[0] = "import", parts[1] = uuid, parts[2] = "confirm"|"cancel"
+  const pendingId = parts[1];
+  const importAction = parts[2];
+
+  if (!pendingId || (importAction !== "confirm" && importAction !== "cancel")) {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+
+  // Fetch pending import — enforce 30-minute TTL
+  const PENDING_TTL_MS = 30 * 60 * 1000;
+  const ttlCutoff = new Date(Date.now() - PENDING_TTL_MS);
+  const [pending] = await db
+    .select()
+    .from(pendingImports)
+    .where(
+      and(
+        eq(pendingImports.id, pendingId),
+        gt(pendingImports.createdAt, ttlCutoff)
+      )
+    )
+    .limit(1);
+
+  if (!pending) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "❌ 此匯入請求已過期或不存在（超過 30 分鐘）",
+      show_alert: true,
+    });
+    // Remove buttons
+    if (query.message) {
+      await editMessageReplyMarkup({
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        reply_markup: { inline_keyboard: [] },
+      });
+    }
+    // Also clean up the stale row if the ID exists but is expired
+    await db.delete(pendingImports).where(eq(pendingImports.id, pendingId));
+    return;
+  }
+
+  // Security: only the owner can confirm/cancel
+  // Verify by checking that the telegram user matches the pending import's userId
+  const [owner] = await db
+    .select({ telegramId: userProfiles.telegramId })
+    .from(userProfiles)
+    .where(eq(userProfiles.id, pending.userId))
+    .limit(1);
+
+  if (!owner || owner.telegramId !== query.from.id) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "你沒有操作這筆匯入的權限",
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Remove buttons regardless of action
+  if (query.message) {
+    await editMessageReplyMarkup({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      reply_markup: { inline_keyboard: [] },
+    });
+  }
+
+  if (importAction === "cancel") {
+    // Delete pending
+    await db.delete(pendingImports).where(eq(pendingImports.id, pendingId));
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "已取消匯入",
+    });
+    await sendMessage({
+      chat_id: query.from.id,
+      text: "❌ <b>已取消持股匯入</b>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // confirm: write to holdings
+  const items = pending.payload as PendingImportItem[];
+
+  // Pre-resolve all symbols so we can reject unknown ones BEFORE writing anything.
+  // This prevents partial success with the wrong suffix (e.g. guessing .TW when
+  // the stock is actually .TWO), and lets us present a single confirm/reject.
+  type ResolvedItem = { symbol: string; sharesLots: number; avgCost: number; rawSymbol: string };
+  const resolved: ResolvedItem[] = [];
+  const unresolved: string[] = [];
+  for (const item of items) {
+    const ticker = await resolveTicker(item.symbol);
+    if (!ticker) {
+      unresolved.push(item.symbol);
+      continue;
+    }
+    resolved.push({
+      symbol: ticker.symbol,
+      sharesLots: item.sharesLots,
+      avgCost: item.avgCost,
+      rawSymbol: item.symbol,
+    });
+  }
+
+  // If ANY row is unresolved, abort the entire import — user should check the list
+  // or run /buy manually for the failed ones. This avoids partial-state confusion.
+  if (unresolved.length > 0) {
+    await db.delete(pendingImports).where(eq(pendingImports.id, pendingId));
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "❌ 部分代號無法對應，匯入已取消",
+    });
+    await sendMessage({
+      chat_id: query.from.id,
+      text: [
+        "❌ <b>匯入已取消</b>",
+        "",
+        `以下代號找不到對應股票：<code>${unresolved.join(", ")}</code>`,
+        "",
+        "請確認代號正確，或稍後重傳截圖。",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // All resolved — write atomically. If anything fails, rollback and no rows are written.
+  let successCount = 0;
+  const errors: string[] = [];
+  try {
+    for (const r of resolved) {
+      await buyHolding({
+        userId: pending.userId,
+        symbol: r.symbol,
+        sharesLots: r.sharesLots,
+        price: r.avgCost,
+        note: "截圖批次匯入",
+      });
+      successCount++;
+    }
+  } catch (err) {
+    console.error("[webhook] import confirm transaction error:", err);
+    errors.push("寫入時發生錯誤，部分資料可能未完全匯入");
+  }
+
+  // Delete pending regardless of success — we don't want retries of the same batch
+  await db.delete(pendingImports).where(eq(pendingImports.id, pendingId));
+
+  await answerCallbackQuery({
+    callback_query_id: query.id,
+    text: `✅ 已匯入 ${successCount} 筆持股`,
+  });
+
+  const resultLines = [`✅ <b>持股匯入完成</b>，成功 ${successCount} 筆`];
+  if (errors.length > 0) {
+    resultLines.push(`⚠️ ${errors.join("；")}`);
+  }
+  resultLines.push("\n輸入 /portfolio 查看最新持股");
+
+  await sendMessage({
+    chat_id: query.from.id,
+    text: resultLines.join("\n"),
     parse_mode: "HTML",
   });
 }
