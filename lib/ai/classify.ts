@@ -6,7 +6,7 @@ import { z } from "zod";
 export const DEFAULT_MODEL = "claude-haiku-4-5";
 
 /** Bump this string whenever the prompt changes. Stored in ai_classifications. */
-export const PROMPT_VERSION = "classify-v1";
+export const PROMPT_VERSION = "classify-v2";
 
 // ─── Response schema ──────────────────────────────────────────────────────────
 
@@ -35,6 +35,10 @@ export const classifySchema = z.discriminatedUnion("is_tip", [
     confidence: z.number().int().min(0).max(100),
     /** All Taiwan stock codes explicitly or clearly implied by the message */
     tickers: z.array(tickerSchema).min(1).max(20),
+    /** Brief company description in Traditional Chinese, max 100 chars (AI-generated) */
+    company_description: z.string().max(100).optional(),
+    /** Relative position of the stock in its sector, e.g. "龍頭"、"二線" (AI-generated) */
+    sector_position: z.string().max(30).optional(),
   }),
 ]);
 
@@ -69,7 +73,9 @@ const SYSTEM_PROMPT = `你是一個台股交易情報分析師。分析以下 Te
   "confidence": 整數0到100,
   "tickers": [
     { "symbol": "4位數字代碼", "sentiment": "bullish"|"bearish"|"neutral", "target_price": 目標價（可省略）}
-  ]
+  ],
+  "company_description": "主要標的的公司業務簡述（繁體中文，50字以內，例如「台積電為全球最大晶圓代工廠」）",
+  "sector_position": "此股在產業內的相對地位（例如「龍頭」「二線」「中小型」「後段」，盡量簡短）"
 }
 
 【欄位說明】
@@ -78,6 +84,8 @@ const SYSTEM_PROMPT = `你是一個台股交易情報分析師。分析以下 Te
 - confidence: 判斷這是明確可行情報的信心，不確定則給低分
 - tickers.symbol: 台股 4-6 位數字代碼，例如 "2330"、"6451"（不加 .TW 後綴）
 - target_price: 新台幣目標價，若原訊息無提及則省略此欄位
+- company_description: 主要標的的公司業務簡述（50字以內）；無法判斷可省略
+- sector_position: 此股在產業內的相對地位（例如「龍頭」「二線」「中小型」「後段」）；無法判斷可省略
 
 【如果不是台股情報】（一般閒聊、純新聞、無方向建議、美股、加密貨幣等）：
 { "is_tip": false, "reason": "原因說明" }

@@ -171,6 +171,9 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
         summary: tips.summary,
         confidence: tips.confidence,
         ticker: tips.ticker,
+        industryCategory: tips.industryCategory,
+        sectorPosition: tips.sectorPosition,
+        companyDescription: tips.companyDescription,
       })
       .from(rawMessages)
       .innerJoin(tips, eq(rawMessages.aiTipId, tips.id))
@@ -185,16 +188,20 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
 
     if (cached) {
       const SENT: Record<string, string> = { bullish: "📈 看多", bearish: "📉 看空", neutral: "➡️ 中性" };
+      const dedupLines = [
+        "📋 <b>此情報 24 小時內已有人提過</b>，直接沿用分析結果：",
+        "",
+        `<b>方向：</b>${SENT[cached.sentiment ?? ""] ?? cached.sentiment}`,
+        cached.confidence != null ? `<b>信心：</b>${cached.confidence}/100` : "",
+        cached.ticker ? `<b>主標的：</b>${cached.ticker}` : "",
+        cached.industryCategory ? `<b>產業：</b>${cached.industryCategory}` : "",
+        cached.sectorPosition ? `<b>地位：</b>${cached.sectorPosition}` : "",
+        cached.companyDescription ? `\n💼 ${cached.companyDescription}` : "",
+        cached.summary ? `\n<b>摘要：</b>${cached.summary}` : "",
+      ];
       await sendMessage({
         chat_id: msg.chat.id,
-        text: [
-          "📋 <b>此情報 24 小時內已有人提過</b>，直接沿用分析結果：",
-          "",
-          `<b>方向：</b>${SENT[cached.sentiment ?? ""] ?? cached.sentiment}`,
-          cached.confidence != null ? `<b>信心：</b>${cached.confidence}/100` : "",
-          cached.ticker ? `<b>主標的：</b>${cached.ticker}` : "",
-          cached.summary ? `\n<b>摘要：</b>${cached.summary}` : "",
-        ].filter(Boolean).join("\n"),
+        text: dedupLines.filter(Boolean).join("\n"),
         parse_mode: "HTML",
       });
       return;
@@ -340,6 +347,7 @@ async function handleCommand(
           confidence: tips.confidence,
           market: tips.market,
           createdAt: tips.createdAt,
+          industryCategory: tips.industryCategory,
         })
         .from(tipTickers)
         .innerJoin(tips, eq(tipTickers.tipId, tips.id))
@@ -375,8 +383,14 @@ async function handleCommand(
         return `• ${date} ${icon}${target}${conf}${summary}`;
       });
 
+      // Pick the first available industry category from recent tips
+      const industryCat = rows.find((r) => r.industryCategory)?.industryCategory ?? null;
+      const titleLine = industryCat
+        ? `📊 <b>${rawSymbol} 情報查詢</b> ｜ ${industryCat}`
+        : `📊 <b>${rawSymbol} 情報查詢</b>`;
+
       const lines = [
-        `📊 <b>${rawSymbol} 情報查詢</b>`,
+        titleLine,
         "",
         `<b>共 ${total} 筆情報</b>`,
         "",
