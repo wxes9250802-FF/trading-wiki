@@ -20,15 +20,15 @@ export const verificationResultEnum = pgEnum("verification_result", [
 // ─── Tip Verifications ────────────────────────────────────────────────────────
 
 /**
- * Price-outcome records created by the T11 verification cron job.
+ * Price-target monitoring records created by the classification worker.
  *
- * One tip gets up to 3 rows: check_days ∈ {7, 14, 30}.
- * The cron runs daily and flips result from 'pending' → 'hit'|'miss'
- * once the required days have elapsed.
+ * One row is created per tip that has a target_price mentioned in the original
+ * message. The daily cron (verify-tips.ts) checks whether the current price
+ * has reached the target and notifies the user when it does.
  *
- * Hit criteria (from CEO plan):
- *   TW / US stocks : price moved ≥ 3 % in the sentiment direction
- *   Crypto         : price moved ≥ 10 % in the sentiment direction
+ * Hit criteria:
+ *   bullish tip → current price >= target_price
+ *   bearish tip → current price <= target_price
  *
  * RLS: same as tips (ANON read, service_role write).
  */
@@ -41,11 +41,18 @@ export const tipVerifications = pgTable("tip_verifications", {
     .notNull()
     .references(() => tips.id, { onDelete: "cascade" }),
 
-  checkDays: integer("check_days").notNull(), // 7 | 14 | 30
+  // Legacy field — set to 0 for target-price monitoring rows
+  checkDays: integer("check_days").default(0),
 
-  // Prices captured at tip creation and at check time
+  // Price at the time the tip was classified
   priceAtTip: numeric("price_at_tip", { precision: 14, scale: 4 }),
+
+  // Price at the time the target was hit
   priceAtCheck: numeric("price_at_check", { precision: 14, scale: 4 }),
+
+  // The target price mentioned in the original tip.
+  // Monitoring only happens when this is set.
+  targetPrice: numeric("target_price", { precision: 14, scale: 4 }),
 
   result: verificationResultEnum("result").default("pending").notNull(),
 
