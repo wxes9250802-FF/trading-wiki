@@ -58,6 +58,11 @@ export const tips = pgTable("tips", {
   targetPrice: numeric("target_price", { precision: 14, scale: 4 }),
   confidence: integer("confidence"), // 0–100
 
+  // Industry / sector enrichment (populated by T3 classify worker)
+  industryCategory: text("industry_category"),   // from FinMind, e.g. "半導體業"
+  companyDescription: text("company_description"), // AI-generated, ≤50 chars
+  sectorPosition: text("sector_position"),          // AI-generated, e.g. "龍頭"
+
   // Source tracking (user-supplied label, e.g. "LINE 群 A")
   sourceLabel: text("source_label"),
 

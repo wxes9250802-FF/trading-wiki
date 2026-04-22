@@ -35,6 +35,7 @@ import { tipVerifications } from "@/lib/db/schema/verifications";
 
 import { classifyMessage, DEFAULT_MODEL, PROMPT_VERSION, type ClassifyMedia } from "@/lib/ai/classify";
 import { fetchCurrentPrice } from "@/lib/price/client";
+import { fetchStockInfo } from "@/lib/finmind/client";
 import { sendMessage } from "@/lib/telegram/client";
 import type { RawMessage } from "@/lib/db/schema/raw-messages";
 
@@ -138,6 +139,9 @@ function buildTipMessage(opts: {
   confidence: number;
   summary: string;
   symbols: string[];
+  industryCategory?: string | null;
+  sectorPosition?: string | null;
+  companyDescription?: string | null;
 }): string {
   const lines = [
     "📊 <b>新情報分類完成</b>",
@@ -147,6 +151,15 @@ function buildTipMessage(opts: {
   ];
   if (opts.symbols.length > 0) {
     lines.push(`<b>股票：</b>${opts.symbols.join("、")}`);
+  }
+  if (opts.industryCategory) {
+    lines.push(`<b>產業：</b>${opts.industryCategory}`);
+  }
+  if (opts.sectorPosition) {
+    lines.push(`<b>地位：</b>${opts.sectorPosition}`);
+  }
+  if (opts.companyDescription) {
+    lines.push("", `💼 ${opts.companyDescription}`);
   }
   lines.push("", `<b>摘要：</b>${opts.summary}`, "", "請確認 AI 分類是否正確：");
   return lines.join("\n");
@@ -207,14 +220,27 @@ async function processMessage(msg: RawMessage): Promise<void> {
     const { result, model, inputTokens, outputTokens, rawResponse } =
       await classifyMessage(msg.messageText, DEFAULT_MODEL, media);
 
+    // Pre-resolve primary symbol and fetch FinMind data BEFORE opening the
+    // transaction — avoids holding a DB connection open during HTTP calls.
+    let primarySymbol: string | null = null;
+    let industryCategory: string | null = null;
+    if (result.is_tip) {
+      const primaryRaw = result.tickers[0];
+      if (primaryRaw) {
+        primarySymbol = await resolveSymbol(primaryRaw.symbol);
+        try {
+          const stockInfo = await fetchStockInfo(primarySymbol);
+          industryCategory = stockInfo?.industryCategory ?? null;
+        } catch {
+          // Non-fatal — classification continues without industry data
+        }
+      }
+    }
+
     await db.transaction(async (tx) => {
       if (result.is_tip) {
         // ── Tip: create tip row + tip_tickers + ai_classification ──────────
-        // Resolve the primary ticker before creating the tip row
         const primaryRaw = result.tickers[0];
-        const primarySymbol = primaryRaw
-          ? await resolveSymbol(primaryRaw.symbol)
-          : null;
 
         const [tip] = await tx
           .insert(tips)
@@ -230,6 +256,9 @@ async function processMessage(msg: RawMessage): Promise<void> {
             targetPrice: primaryRaw?.target_price?.toString() ?? null,
             confidence: result.confidence,
             aiClassified: true,
+            industryCategory,
+            companyDescription: result.company_description ?? null,
+            sectorPosition: result.sector_position ?? null,
           })
           .returning({ id: tips.id });
 
@@ -283,6 +312,9 @@ async function processMessage(msg: RawMessage): Promise<void> {
             confidence: result.confidence,
             summary: result.summary,
             symbols: resolvedTickers.map((t) => t.symbol),
+            industryCategory,
+            sectorPosition: result.sector_position ?? null,
+            companyDescription: result.company_description ?? null,
           });
 
           await sendMessage({
