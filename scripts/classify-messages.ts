@@ -307,16 +307,17 @@ async function processMessage(msg: RawMessage): Promise<void> {
           });
         }
 
-        // ── T11: create price verification rows (non-blocking) ───────────
-        // Only for directional tips (bullish/bearish) with a resolved ticker.
-        // We fetch the current price as the baseline (price_at_tip).
-        // The verify-tips.ts cron will check back at 7/14/30 days.
-        if (result.sentiment !== "neutral" && primarySymbol) {
+        // ── T11: create price target monitoring row (non-blocking) ──────
+        // Only when: directional tip + resolved ticker + target price mentioned.
+        // The verify-tips.ts cron checks daily whether price has reached the
+        // target and notifies the user when it does.
+        const tipTargetPrice = primaryRaw?.target_price ?? null;
+        if (result.sentiment !== "neutral" && primarySymbol && tipTargetPrice) {
           try {
             const priceAtTip = await fetchCurrentPrice(primarySymbol, result.market);
 
             if (priceAtTip !== null) {
-              // Idempotency: skip if rows already exist (e.g. on retry)
+              // Idempotency: skip if a row already exists (e.g. on retry)
               const [existing] = await db
                 .select({ id: tipVerifications.id })
                 .from(tipVerifications)
@@ -324,21 +325,19 @@ async function processMessage(msg: RawMessage): Promise<void> {
                 .limit(1);
 
               if (!existing) {
-                await db.insert(tipVerifications).values(
-                  [7, 14, 30].map((checkDays) => ({
-                    tipId: tip.id,
-                    checkDays,
-                    priceAtTip: priceAtTip.toString(),
-                  }))
-                );
-                console.log(`    → verification rows created (priceAtTip=${priceAtTip})`);
+                await db.insert(tipVerifications).values({
+                  tipId: tip.id,
+                  priceAtTip: priceAtTip.toString(),
+                  targetPrice: tipTargetPrice.toString(),
+                });
+                console.log(`    → target monitoring created (priceAtTip=${priceAtTip}, target=${tipTargetPrice})`);
               }
             } else {
-              console.log(`    → price fetch failed, verification setup skipped`);
+              console.log(`    → price fetch failed, target monitoring skipped`);
             }
           } catch (verifyErr) {
             // Non-fatal — verification is best-effort
-            console.warn(`    → verification setup error: ${String(verifyErr)}`);
+            console.warn(`    → target monitoring setup error: ${String(verifyErr)}`);
           }
         }
       } else {
