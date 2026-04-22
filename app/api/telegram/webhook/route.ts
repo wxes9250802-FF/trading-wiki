@@ -479,7 +479,7 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async function triggerClassifyWorkflow(): Promise<void> {
-  const token = process.env["GITHUB_PAT"];
+  const token = process.env["GH_PAT"];
   if (!token) return; // no-op if not configured
 
   const res = await fetch(
