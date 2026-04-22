@@ -1,10 +1,8 @@
-// Schema placeholder — populated in T2 (Database Schema & Migrations).
-// Export all tables from this file so drizzle.config.ts and lib/db/client.ts
-// can reference a single entry point.
-//
-// Example (T2 will add real tables):
-//   export * from "./users";
-//   export * from "./trades";
+// Central schema export — drizzle.config.ts and lib/db/client.ts both point here.
 
-// Empty export to mark this as a TypeScript module.
-export {};
+export * from "./users";
+export * from "./tickers";
+export * from "./tips";
+export * from "./raw-messages";
+export * from "./verifications";
+export * from "./classifications";
