@@ -32,6 +32,7 @@ import { buyHolding, sellHolding, listPortfolio } from "@/lib/holdings/manager";
 import { parseHoldingsPhoto } from "@/lib/holdings/import-from-photo";
 import { resolveTicker } from "@/lib/ticker/resolver";
 import { holdings as holdingsTable } from "@/lib/db/schema/holdings";
+import { priceAlerts } from "@/lib/db/schema/price-alerts";
 
 const MAX_TEXT_CHARS = 2000;
 const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -280,11 +281,18 @@ async function handleCommand(
           "/portfolio — 查看我的持股與損益",
           "（傳圖時 caption 寫 /import — 截圖批次匯入）",
           "",
+          "🔔 <b>盤中警示：</b>",
+          "/alert 代號 +漲% -跌% vol 量倍數 — 設定警示條件",
+          "  例如 <code>/alert 2330 +3 -5</code>（漲 3% 或跌 5% 通知）",
+          "  或 <code>/alert 2330 -5 vol 2</code>（跌 5% 或量 2 倍通知）",
+          "/alerts — 列出所有已設定的警示",
+          "/unalert 代號 — 移除某檔警示",
+          "",
           "（管理員限定）",
           "/invite — 產生新邀請碼",
           "",
           "範例：",
-          "<code>/q 2330</code>　<code>/q NVDA</code>　<code>/q BTC</code>",
+          "<code>/q 2330</code>　<code>/alert 2330 +5 -3</code>",
         ].join("\n"),
         parse_mode: "HTML",
       });
@@ -451,6 +459,21 @@ async function handleCommand(
 
     if (command === "/portfolio") {
       await handlePortfolio(profile.id, chatId);
+      return;
+    }
+
+    if (command === "/alert") {
+      await handleAlertSet(rawCommand, profile.id, chatId);
+      return;
+    }
+
+    if (command === "/alerts") {
+      await handleAlertList(profile.id, chatId);
+      return;
+    }
+
+    if (command === "/unalert") {
+      await handleAlertRemove(rawCommand, profile.id, chatId);
       return;
     }
 
@@ -742,6 +765,275 @@ async function handlePortfolio(userId: string, chatId: number): Promise<void> {
       parse_mode: "HTML",
     });
   }
+}
+
+// ─── Price alerts: /alert / /alerts / /unalert ────────────────────────────────
+
+/**
+ * Parse /alert tokens. Accepts:
+ *   /alert 2330 +3 -5           → up=3, down=-5
+ *   /alert 2330 -5              → down=-5 only
+ *   /alert 2330 +3              → up=3 only
+ *   /alert 2330 vol 2.5         → volume only
+ *   /alert 2330 +3 -5 vol 2     → all three
+ * Returns null on invalid input.
+ */
+function parseAlertTokens(tokens: string[]): {
+  upPct: number | null;
+  downPct: number | null;
+  volumeMultiplier: number | null;
+} | null {
+  let upPct: number | null = null;
+  let downPct: number | null = null;
+  let volumeMultiplier: number | null = null;
+
+  let i = 0;
+  while (i < tokens.length) {
+    const tok = tokens[i]!.trim();
+    if (!tok) {
+      i++;
+      continue;
+    }
+
+    if (tok.toLowerCase() === "vol") {
+      const next = tokens[i + 1];
+      const num = parseFloat(next ?? "");
+      if (!isFinite(num) || num <= 0) return null;
+      volumeMultiplier = num;
+      i += 2;
+      continue;
+    }
+
+    // +N or -N
+    const match = /^([+\-])(\d+(?:\.\d+)?)$/.exec(tok);
+    if (!match) return null;
+    const sign = match[1];
+    const num = parseFloat(match[2]!);
+    if (!isFinite(num) || num <= 0) return null;
+
+    if (sign === "+") upPct = num;
+    else downPct = -num;
+
+    i++;
+  }
+
+  // At least one must be set
+  if (upPct === null && downPct === null && volumeMultiplier === null) return null;
+
+  return { upPct, downPct, volumeMultiplier };
+}
+
+function formatAlertLine(row: {
+  symbol: string;
+  upPct: string | null;
+  downPct: string | null;
+  volumeMultiplier: string | null;
+}): string {
+  const parts: string[] = [];
+  if (row.upPct !== null) parts.push(`漲 ≥ ${parseFloat(row.upPct).toFixed(1)}%`);
+  if (row.downPct !== null) parts.push(`跌 ≤ ${parseFloat(row.downPct).toFixed(1)}%`);
+  if (row.volumeMultiplier !== null) parts.push(`量 × ${parseFloat(row.volumeMultiplier).toFixed(1)}`);
+  return `${row.symbol} ｜ ${parts.join("  ")}`;
+}
+
+async function handleAlertSet(
+  rawCommand: string,
+  userId: string,
+  chatId: number
+): Promise<void> {
+  const parts = rawCommand.trim().split(/\s+/).slice(1); // drop "/alert"
+  const rawSymbolToken = parts[0] ?? "";
+
+  if (!rawSymbolToken) {
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        "❓ <b>用法：</b>",
+        "<code>/alert 代號 +漲% -跌% vol 量倍數</code>",
+        "",
+        "<b>範例：</b>",
+        "<code>/alert 2330 +3 -5</code>（漲 3% 或跌 5% 通知）",
+        "<code>/alert 2330 -5</code>（只跌 5% 通知）",
+        "<code>/alert 2330 vol 2.5</code>（只量 2.5 倍通知）",
+        "<code>/alert 2330 +3 -5 vol 2</code>（全部）",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const rawSymbol = rawSymbolToken.toUpperCase();
+  if (!/^\d{4,6}$/.test(rawSymbol)) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 代號格式錯誤，台股請用 4-6 位數字，例如 <code>2330</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const parsed = parseAlertTokens(parts.slice(1));
+  if (!parsed) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 門檻格式錯誤，至少需要一個 <code>+N</code>、<code>-N</code>、或 <code>vol N</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Resolve symbol
+  const ticker = await resolveTicker(rawSymbol);
+  if (!ticker) {
+    await sendMessage({
+      chat_id: chatId,
+      text: `❌ 找不到代號 <code>${rawSymbol}</code>，請確認是台股代碼。`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const { upPct, downPct, volumeMultiplier } = parsed;
+
+  // Upsert
+  await db
+    .insert(priceAlerts)
+    .values({
+      userId,
+      symbol: ticker.symbol,
+      upPct: upPct !== null ? upPct.toString() : null,
+      downPct: downPct !== null ? downPct.toString() : null,
+      volumeMultiplier: volumeMultiplier !== null ? volumeMultiplier.toString() : null,
+      enabled: true,
+    })
+    .onConflictDoUpdate({
+      target: [priceAlerts.userId, priceAlerts.symbol],
+      set: {
+        upPct: upPct !== null ? upPct.toString() : null,
+        downPct: downPct !== null ? downPct.toString() : null,
+        volumeMultiplier: volumeMultiplier !== null ? volumeMultiplier.toString() : null,
+        enabled: true,
+        updatedAt: new Date(),
+      },
+    });
+
+  const confirmParts: string[] = [];
+  if (upPct !== null) confirmParts.push(`漲 ≥ ${upPct.toFixed(1)}%`);
+  if (downPct !== null) confirmParts.push(`跌 ≤ ${downPct.toFixed(1)}%`);
+  if (volumeMultiplier !== null) confirmParts.push(`量 × ${volumeMultiplier.toFixed(1)}`);
+
+  await sendMessage({
+    chat_id: chatId,
+    text: [
+      `🔔 <b>已設定警示</b>`,
+      "",
+      `<b>標的：</b>${ticker.symbol}`,
+      `<b>條件：</b>${confirmParts.join("  ／  ")}`,
+      "",
+      `盤中 09:30-13:30 每小時自動檢查，觸發時通知你。`,
+    ].join("\n"),
+    parse_mode: "HTML",
+  });
+}
+
+async function handleAlertList(userId: string, chatId: number): Promise<void> {
+  const rows = await db
+    .select({
+      symbol: priceAlerts.symbol,
+      upPct: priceAlerts.upPct,
+      downPct: priceAlerts.downPct,
+      volumeMultiplier: priceAlerts.volumeMultiplier,
+      enabled: priceAlerts.enabled,
+    })
+    .from(priceAlerts)
+    .where(eq(priceAlerts.userId, userId))
+    .orderBy(priceAlerts.symbol);
+
+  if (rows.length === 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        "📭 你尚未設定任何盤中警示。",
+        "",
+        "用 <code>/alert 代號 條件</code> 開始設定，例如：",
+        "<code>/alert 2330 +3 -5</code>",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const active = rows.filter((r) => r.enabled);
+  const disabled = rows.filter((r) => !r.enabled);
+
+  const lines: string[] = [];
+  lines.push(`🔔 <b>你的盤中警示（${active.length} 檔）</b>`);
+  lines.push("");
+
+  active.forEach((r, idx) => {
+    lines.push(`${idx + 1}. ${formatAlertLine(r)}`);
+  });
+
+  if (disabled.length > 0) {
+    lines.push("");
+    lines.push(`（已停用 ${disabled.length} 檔）`);
+  }
+
+  lines.push("");
+  lines.push(`用 <code>/unalert 代號</code> 移除警示`);
+
+  await sendMessage({
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+  });
+}
+
+async function handleAlertRemove(
+  rawCommand: string,
+  userId: string,
+  chatId: number
+): Promise<void> {
+  const parts = rawCommand.trim().split(/\s+/);
+  const rawSymbolToken = parts[1] ?? "";
+
+  if (!rawSymbolToken) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❓ 用法：<code>/unalert 代號</code>，例如 <code>/unalert 2330</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const rawSymbol = rawSymbolToken.toUpperCase();
+  const ticker = await resolveTicker(rawSymbol);
+  const targetSymbol = ticker?.symbol ?? rawSymbol;
+
+  const deleted = await db
+    .delete(priceAlerts)
+    .where(
+      and(
+        eq(priceAlerts.userId, userId),
+        eq(priceAlerts.symbol, targetSymbol)
+      )
+    )
+    .returning({ symbol: priceAlerts.symbol });
+
+  if (deleted.length === 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: `ℹ️ 找不到 <code>${targetSymbol}</code> 的警示設定（可能已被移除或從未設定）。`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  await sendMessage({
+    chat_id: chatId,
+    text: `✅ 已移除 <code>${targetSymbol}</code> 的盤中警示。`,
+    parse_mode: "HTML",
+  });
 }
 
 // ─── Holdings: photo import ───────────────────────────────────────────────────
