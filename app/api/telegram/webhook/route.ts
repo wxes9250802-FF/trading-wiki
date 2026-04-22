@@ -373,7 +373,7 @@ async function handleCommand(
       return;
     }
 
-    if (command === "/stats" || command === "/mystats") {
+    if (command === "/stats") {
       const rows = await db
         .select({ market: tips.market, sentiment: tips.sentiment })
         .from(tips);
