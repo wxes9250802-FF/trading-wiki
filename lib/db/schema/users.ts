@@ -50,8 +50,8 @@ export const userProfiles = pgTable("user_profiles", {
 // ─── Invite Codes ─────────────────────────────────────────────────────────────
 
 /**
- * Single-use, time-limited invite codes.
- * Admin generates via T12 UI; recipient uses at /auth/signup.
+ * Single-use invite codes.
+ * Admin generates via /invite command; link expires only after first use.
  *
  * RLS: service_role only.
  */
@@ -66,7 +66,7 @@ export const inviteCodes = pgTable("invite_codes", {
 
   usedBy: uuid("used_by"), // user_profiles.id, set on redemption
 
-  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }), // nullable — no time expiry
 
   usedAt: timestamp("used_at", { withTimezone: true }),
 

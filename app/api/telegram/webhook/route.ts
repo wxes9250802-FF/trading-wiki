@@ -276,7 +276,6 @@ async function handleCommand(
           "🎟 <b>邀請連結已產生</b>",
           "",
           `<b>邀請碼：</b><code>${code}</code>`,
-          "<b>有效期限：</b>7 天",
           "",
           "<b>傳給對方這個連結：</b>",
           botLink,
@@ -457,8 +456,7 @@ async function handleInviteRedemption(
       and(
         eq(inviteCodes.code, code),
         eq(inviteCodes.isRevoked, false),
-        isNull(inviteCodes.usedAt),
-        gt(inviteCodes.expiresAt, now)
+        isNull(inviteCodes.usedAt)
       )
     )
     .limit(1);
@@ -535,10 +533,9 @@ async function createInviteCode(createdBy: string): Promise<string> {
   const code = Array.from(bytes)
     .map((b) => CHARSET[b % 32]!)
     .join("");
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
   const [row] = await db
     .insert(inviteCodes)
-    .values({ code, createdBy, expiresAt })
+    .values({ code, createdBy })
     .returning({ code: inviteCodes.code });
   if (!row) throw new Error("Failed to create invite code");
   return row.code;

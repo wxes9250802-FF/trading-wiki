@@ -86,10 +86,6 @@ export async function validateInviteCode(
     return { valid: false, error: "Invite code has already been used" };
   }
 
-  if (row.expiresAt < new Date()) {
-    return { valid: false, error: "Invite code has expired" };
-  }
-
   return { valid: true };
 }
 
