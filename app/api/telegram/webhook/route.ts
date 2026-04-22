@@ -561,6 +561,16 @@ async function handleBuy(
       ].join("\n"),
       parse_mode: "HTML",
     });
+
+    // Only prompt if user has no alert for this symbol yet
+    const [existing] = await db
+      .select({ id: priceAlerts.id })
+      .from(priceAlerts)
+      .where(and(eq(priceAlerts.userId, userId), eq(priceAlerts.symbol, symbol)))
+      .limit(1);
+    if (!existing) {
+      await sendAlertSetupPrompt(chatId, symbol, displayName);
+    }
   } catch (err) {
     console.error("[webhook] buyHolding error:", err);
     await sendMessage({
@@ -1036,6 +1046,156 @@ async function handleAlertRemove(
   });
 }
 
+// ─── Alert setup: inline-keyboard prompt after /buy and /import ──────────────
+
+/**
+ * Send a "pick an alert preset" prompt with inline buttons.
+ * callback_data format: "alert:{symbol}:{preset}" where preset ∈
+ *   "3" | "5" | "7" | "10" | "skip"
+ *
+ * The caller has NOT saved an alert yet — this prompt is the opt-in.
+ */
+async function sendAlertSetupPrompt(
+  chatId: number,
+  symbol: string,
+  displayName?: string
+): Promise<void> {
+  const label = displayName ? `${symbol} ${displayName}` : symbol;
+  await sendMessage({
+    chat_id: chatId,
+    text: [
+      `🔔 <b>為 ${label} 設定警示</b>`,
+      "",
+      "選一個門檻（漲跌都會通知）：",
+      "",
+      `單邊或自訂：<code>/alert ${symbol} +漲% -跌%</code>`,
+    ].join("\n"),
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "±3%", callback_data: `alert:${symbol}:3` },
+          { text: "±5%", callback_data: `alert:${symbol}:5` },
+          { text: "±7%", callback_data: `alert:${symbol}:7` },
+          { text: "±10%", callback_data: `alert:${symbol}:10` },
+        ],
+        [{ text: "略過", callback_data: `alert:${symbol}:skip` }],
+      ],
+    },
+  });
+}
+
+/**
+ * Handle a tap on an alert-setup preset button.
+ * Verifies the tapper is the owner (via telegram_id lookup), writes the alert
+ * (or skips), then strips the buttons from the original message.
+ */
+async function handleAlertSetupCallback(
+  query: TelegramCallbackQuery,
+  data: string
+): Promise<void> {
+  // data: "alert:{symbol}:{preset}"
+  // Symbol can contain "." so we split cleverly from both ends
+  const rest = data.slice("alert:".length);
+  const lastColon = rest.lastIndexOf(":");
+  if (lastColon < 0) {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+  const symbol = rest.slice(0, lastColon);
+  const preset = rest.slice(lastColon + 1);
+
+  if (!symbol) {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+
+  // Resolve the tapper's user_id via telegram_id
+  const [profile] = await db
+    .select({ id: userProfiles.id })
+    .from(userProfiles)
+    .where(eq(userProfiles.telegramId, query.from.id))
+    .limit(1);
+
+  if (!profile) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "找不到你的帳號",
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Strip buttons first so the UX feels responsive
+  if (query.message) {
+    await editMessageReplyMarkup({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
+  }
+
+  if (preset === "skip") {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "已略過警示設定",
+    });
+    await sendMessage({
+      chat_id: query.from.id,
+      text: `⏭ <b>${symbol}</b> 未設定警示。日後可用 <code>/alert ${symbol} +漲% -跌%</code> 自訂。`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const pct = parseInt(preset, 10);
+  if (!Number.isFinite(pct) || pct <= 0) {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+
+  const upPct = pct;
+  const downPct = -pct;
+
+  await db
+    .insert(priceAlerts)
+    .values({
+      userId: profile.id,
+      symbol,
+      upPct: upPct.toString(),
+      downPct: downPct.toString(),
+      volumeMultiplier: null,
+      enabled: true,
+    })
+    .onConflictDoUpdate({
+      target: [priceAlerts.userId, priceAlerts.symbol],
+      set: {
+        upPct: upPct.toString(),
+        downPct: downPct.toString(),
+        // keep existing volumeMultiplier — user may have set it via /alert
+        enabled: true,
+        updatedAt: new Date(),
+      },
+    });
+
+  await answerCallbackQuery({
+    callback_query_id: query.id,
+    text: `✅ 已設定 ${symbol} ±${pct}% 警示`,
+  });
+
+  await sendMessage({
+    chat_id: query.from.id,
+    text: [
+      `🔔 <b>${symbol} 警示已設定</b>`,
+      `漲 ≥ ${upPct}% 或跌 ≤ ${downPct}% 會通知你`,
+      "",
+      `想改門檻：<code>/alert ${symbol} +X -Y</code>`,
+      `關閉：<code>/unalert ${symbol}</code>`,
+    ].join("\n"),
+    parse_mode: "HTML",
+  });
+}
+
 // ─── Holdings: photo import ───────────────────────────────────────────────────
 
 async function handleImportPhoto(
@@ -1284,6 +1444,12 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
   // ── Import callback: "import:{uuid}:confirm" or "import:{uuid}:cancel" ───
   if (data.startsWith("import:")) {
     await handleImportCallback(query, data);
+    return;
+  }
+
+  // ── Alert setup: "alert:{symbol}:{preset}" where preset ∈ {3,5,7,10,skip} ─
+  if (data.startsWith("alert:")) {
+    await handleAlertSetupCallback(query, data);
     return;
   }
 
@@ -1541,6 +1707,26 @@ async function handleImportCallback(
     text: resultLines.join("\n"),
     parse_mode: "HTML",
   });
+
+  // ── Alert setup prompts — one inline-keyboard per newly imported symbol ──
+  // Only prompt for symbols the user doesn't already have an alert on.
+  if (successCount > 0) {
+    for (const r of resolved) {
+      const [existing] = await db
+        .select({ id: priceAlerts.id })
+        .from(priceAlerts)
+        .where(
+          and(
+            eq(priceAlerts.userId, pending.userId),
+            eq(priceAlerts.symbol, r.symbol)
+          )
+        )
+        .limit(1);
+      if (!existing) {
+        await sendAlertSetupPrompt(query.from.id, r.symbol);
+      }
+    }
+  }
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
