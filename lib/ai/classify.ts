@@ -111,7 +111,6 @@ export async function classifyMessage(
   const client = getClient();
 
   // Build content parts — prepend media before text if present
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const parts: any[] = [];
 
   if (media?.type === "photo") {
