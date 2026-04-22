@@ -141,12 +141,17 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
       if (mediaType === "photo") ackParts.push("📷 截圖");
       else if (mediaType === "pdf") ackParts.push("📄 PDF");
       else ackParts.push("📝 訊息");
-      ackParts.push("已收到，AI 分析中…（通常 5 分鐘內完成）");
+      ackParts.push("已收到，AI 分析中…");
 
       await sendMessage({
         chat_id: msg.chat.id,
         text: ackParts.join(""),
         parse_mode: "HTML",
+      });
+
+      // Trigger classification immediately (fire-and-forget)
+      triggerClassifyWorkflow().catch((err) => {
+        console.warn("[webhook] classify trigger failed:", err);
       });
     }
   } catch (err) {
@@ -472,6 +477,30 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+async function triggerClassifyWorkflow(): Promise<void> {
+  const token = process.env["GITHUB_PAT"];
+  if (!token) return; // no-op if not configured
+
+  const res = await fetch(
+    "https://api.github.com/repos/wxes9250802-FF/trading-wiki/actions/workflows/classify-messages.yml/dispatches",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ref: "main" }),
+    }
+  );
+
+  // 204 = success, anything else is an error
+  if (!res.ok && res.status !== 204) {
+    throw new Error(`GitHub API ${res.status}`);
+  }
+}
 
 function resolveMedia(msg: TelegramMessage): { mediaType: string | null; mediaFileId: string | null } {
   if (msg.photo?.length) {
