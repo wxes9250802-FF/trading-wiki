@@ -13,10 +13,14 @@ import { sql } from "drizzle-orm";
 
 /**
  * Deduplication log for T6 intraday price/volume alerts.
- * One row per (symbol, alert_date, alert_type) — prevents duplicate pushes
- * for the same condition on the same trading day.
+ * One row per (user_id, symbol, alert_date, alert_type) — prevents duplicate
+ * pushes for the same condition on the same trading day for the same user.
  *
  * alert_type values: "price_up" | "price_down" | "volume_spike"
+ *
+ * user_id was added when alerts became per-user (/alert command); different
+ * users with different thresholds on the same symbol each get their own
+ * dedup window.
  */
 export const intradayAlertLog = pgTable(
   "intraday_alert_log",
@@ -24,6 +28,8 @@ export const intradayAlertLog = pgTable(
     id: uuid("id")
       .primaryKey()
       .default(sql`gen_random_uuid()`),
+
+    userId: uuid("user_id").notNull(),
 
     symbol: text("symbol").notNull(),
 
@@ -39,7 +45,14 @@ export const intradayAlertLog = pgTable(
       .notNull()
       .default(sql`now()`),
   },
-  (t) => [unique("intraday_alert_log_symbol_date_type_unique").on(t.symbol, t.alertDate, t.alertType)]
+  (t) => [
+    unique("intraday_alert_log_user_symbol_date_type_unique").on(
+      t.userId,
+      t.symbol,
+      t.alertDate,
+      t.alertType
+    ),
+  ]
 );
 
 export type IntradayAlert = typeof intradayAlertLog.$inferSelect;
