@@ -28,6 +28,26 @@ import {
 import type { TelegramUpdate, TelegramCallbackQuery, TelegramMessage } from "@/lib/telegram/types";
 
 const MAX_TEXT_CHARS = 2000;
+const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// ─── Content hash ─────────────────────────────────────────────────────────────
+
+/**
+ * Returns a 16-char hex hash of normalised text, or null for media placeholders.
+ * Used for 24-hour deduplication across users.
+ */
+async function computeContentHash(text: string): Promise<string | null> {
+  const PLACEHOLDERS = ["[截圖]", "[PDF 文件]"];
+  if (PLACEHOLDERS.includes(text.trim())) return null;
+
+  const normalised = text.trim().toLowerCase().replace(/\s+/g, " ");
+  const encoded = new TextEncoder().encode(normalised);
+  const hashBuffer = await crypto.subtle.digest("SHA-256", encoded);
+  const hex = Array.from(new Uint8Array(hashBuffer))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+  return hex.slice(0, 16);
+}
 const WEBHOOK_SECRET = process.env["TELEGRAM_WEBHOOK_SECRET"];
 
 // ─── Main handler ─────────────────────────────────────────────────────────────
@@ -117,6 +137,50 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
   // Placeholder text for media-only messages (no caption)
   const finalText = storedText || (mediaType === "photo" ? "[截圖]" : "[PDF 文件]");
 
+  // ── Dedup check: same text from a different user within 24h ──────────────
+  const contentHash = await computeContentHash(finalText);
+  if (contentHash) {
+    const dedupCutoff = new Date(Date.now() - DEDUP_WINDOW_MS);
+    const [cached] = await db
+      .select({
+        tipId: rawMessages.aiTipId,
+        market: tips.market,
+        sentiment: tips.sentiment,
+        summary: tips.summary,
+        confidence: tips.confidence,
+        ticker: tips.ticker,
+      })
+      .from(rawMessages)
+      .innerJoin(tips, eq(rawMessages.aiTipId, tips.id))
+      .where(
+        and(
+          eq(rawMessages.contentHash, contentHash),
+          eq(rawMessages.status, "done"),
+          gt(rawMessages.createdAt, dedupCutoff)
+        )
+      )
+      .limit(1);
+
+    if (cached) {
+      const MARKET: Record<string, string> = { TW: "🇹🇼 台股", US: "🇺🇸 美股", CRYPTO: "₿ 加密貨幣" };
+      const SENT: Record<string, string> = { bullish: "📈 看多", bearish: "📉 看空", neutral: "➡️ 中性" };
+      await sendMessage({
+        chat_id: msg.chat.id,
+        text: [
+          "📋 <b>此情報 24 小時內已有人提過</b>，直接沿用分析結果：",
+          "",
+          `<b>市場：</b>${MARKET[cached.market ?? ""] ?? cached.market}`,
+          `<b>方向：</b>${SENT[cached.sentiment ?? ""] ?? cached.sentiment}`,
+          cached.confidence != null ? `<b>信心：</b>${cached.confidence}/100` : "",
+          cached.ticker ? `<b>主標的：</b>${cached.ticker}` : "",
+          cached.summary ? `\n<b>摘要：</b>${cached.summary}` : "",
+        ].filter(Boolean).join("\n"),
+        parse_mode: "HTML",
+      });
+      return;
+    }
+  }
+
   try {
     const inserted = await db
       .insert(rawMessages)
@@ -131,11 +195,12 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
         status: "pending",
         mediaType,
         mediaFileId,
+        contentHash,
       })
       .onConflictDoNothing()
       .returning({ id: rawMessages.id });
 
-    // Only ack if we actually stored a new row (not a duplicate)
+    // Only ack if we actually stored a new row (not a duplicate update_id)
     if (inserted.length > 0) {
       const ackParts: string[] = [];
       if (mediaType === "photo") ackParts.push("📷 截圖");
