@@ -9,3 +9,4 @@ export * from "./classifications";
 export * from "./holdings";
 export * from "./pending-imports";
 export * from "./chip-alerts";
+export * from "./intraday-alerts";
