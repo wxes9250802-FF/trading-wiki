@@ -133,7 +133,13 @@ export async function classifyMessage(
   const response = await client.messages.create({
     model,
     max_tokens: 1024,
-    system: SYSTEM_PROMPT,
+    system: [
+      {
+        type: "text",
+        text: SYSTEM_PROMPT,
+        cache_control: { type: "ephemeral" },
+      },
+    ],
     messages: [{ role: "user", content: parts }],
   });
 
