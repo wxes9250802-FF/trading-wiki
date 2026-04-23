@@ -149,6 +149,55 @@ export async function fetchLatestPrice(stockId: string): Promise<number | null> 
   }
 }
 
+export interface LatestQuote {
+  date: string;           // "YYYY-MM-DD"
+  close: number;
+  open: number;
+  high: number;
+  low: number;
+  volume: number;         // in shares (not 張)
+  prevClose: number | null;
+  changeAbs: number | null;
+  changePct: number | null;
+}
+
+/**
+ * Fetch the latest trading day's OHLCV plus day-over-day change.
+ * Looks back 7 days to survive long weekends/holidays. Returns null on any error.
+ */
+export async function fetchLatestQuote(stockId: string): Promise<LatestQuote | null> {
+  const rows = await fetchDailyOHLCV(
+    stockId,
+    (() => {
+      const d = new Date();
+      d.setDate(d.getDate() - 7);
+      return d.toISOString().slice(0, 10);
+    })()
+  );
+  if (!rows || rows.length === 0) return null;
+
+  const last = rows[rows.length - 1]!;
+  const prev = rows.length >= 2 ? rows[rows.length - 2]! : null;
+  const prevClose = prev ? prev.close : null;
+  const changeAbs = prevClose !== null ? last.close - prevClose : null;
+  const changePct =
+    prevClose !== null && prevClose > 0
+      ? ((last.close - prevClose) / prevClose) * 100
+      : null;
+
+  return {
+    date: last.date,
+    close: last.close,
+    open: last.open,
+    high: last.high,
+    low: last.low,
+    volume: last.volume,
+    prevClose,
+    changeAbs,
+    changePct,
+  };
+}
+
 /**
  * Fetch daily OHLCV data for a stock from a given start date.
  * Uses TaiwanStockPrice dataset — returns the rows sorted by date ascending.

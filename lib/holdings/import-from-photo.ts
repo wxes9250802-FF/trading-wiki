@@ -4,29 +4,48 @@ import Anthropic from "@anthropic-ai/sdk";
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface ParsedHoldingItem {
-  symbol: string;      // 4-6 位數字台股代碼（原始，未正規化）
+  symbol: string;      // 4-5 位數字台股代碼（原始，未正規化）
   sharesLots: number;  // 張數
   avgCost: number;     // 每股成本
+}
+
+export interface ParseHoldingsResult {
+  items: ParsedHoldingItem[];
+  /** Warrants / other unsupported instruments Claude identified and skipped. */
+  skippedWarrants: string[];
 }
 
 // ─── Claude Vision prompt ──────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `你是台股持股解析助手。這張截圖是台股券商 APP 的持股明細畫面。
-請把每一筆持股抽出，回傳 JSON 陣列：
 
-[
-  { "symbol": "2330", "sharesLots": 10, "avgCost": 985.5 },
-  ...
-]
+請解析每一筆持股，分成兩類回傳 JSON 物件：
+
+{
+  "items": [
+    { "symbol": "2330", "sharesLots": 10, "avgCost": 985.5 },
+    ...
+  ],
+  "skippedWarrants": ["08501U", "739445"]
+}
 
 規則：
-- symbol: 4-6 位數字台股代碼（不加 .TW 後綴）
-- sharesLots: 張數（若圖上是股數，除以 1000）
+- items 只放**一般股票或 ETF**，symbol 為 4-5 位純數字台股代碼（不加 .TW 後綴，例如 "2330"、"1711"、"0050"、"00878"）
+- sharesLots: 張數（若圖上顯示股數，除以 1000；若顯示「張」直接取用）
 - avgCost: 每股成本價（新台幣）
-- 看不清楚或無法辨識的整筆跳過
-- 如果整張圖看不出任何持股，回傳空陣列 []
+- skippedWarrants 放所有被跳過的「權證」代碼（原樣），讓使用者知道哪些被忽略
+- 看不清楚、欄位不全的整筆跳過（items 與 skippedWarrants 都不放）
+- 如果整張圖沒有任何持股，回傳 {"items": [], "skippedWarrants": []}
 
-只回傳 JSON 陣列，不加其他文字。`;
+**務必放進 skippedWarrants 而非 items 的項目：**
+- 權證：代號含英文字母（如 "08501U"）、代號為 6 位數、或名稱含「購」「售」「認購」「認售」「牛」「熊」等字樣
+
+**完全忽略（兩邊都不放）的項目：**
+- 期貨、選擇權、期指
+- 基金、境外債券、特別股
+- 興櫃、未上市
+
+只回傳 JSON 物件，不加其他文字、不加 markdown 標記。`;
 
 // ─── Client ───────────────────────────────────────────────────────────────────
 
@@ -45,11 +64,12 @@ function getClient(): Anthropic {
 
 /**
  * 傳入 base64 JPEG 圖片，呼叫 Claude Vision 解析台股持股截圖。
- * 回傳解析出的持股陣列；若無法辨識或出錯回傳 null。
+ * 回傳 items（股票/ETF）與 skippedWarrants（被識別但不匯入的權證代碼）；
+ * 若 Vision 失敗或 JSON 無法解析，回傳 null。
  */
 export async function parseHoldingsPhoto(
   base64: string
-): Promise<ParsedHoldingItem[] | null> {
+): Promise<ParseHoldingsResult | null> {
   const client = getClient();
 
   let response: Anthropic.Message;
@@ -72,7 +92,7 @@ export async function parseHoldingsPhoto(
             },
             {
               type: "text",
-              text: "請解析這張持股截圖，回傳 JSON 陣列。",
+              text: '請解析這張持股截圖，回傳 {"items": [...], "skippedWarrants": [...]} JSON 物件。',
             },
           ],
         },
@@ -104,31 +124,62 @@ export async function parseHoldingsPhoto(
     return null;
   }
 
-  if (!Array.isArray(parsed)) {
-    console.error("[import-from-photo] Expected array, got:", typeof parsed);
+  // Accept either the new object shape {items, skippedWarrants} or a legacy
+  // array (older Claude responses ignoring the instruction).
+  let rawItems: unknown[] = [];
+  let rawSkipped: unknown[] = [];
+  if (Array.isArray(parsed)) {
+    rawItems = parsed;
+  } else if (typeof parsed === "object" && parsed !== null) {
+    const obj = parsed as Record<string, unknown>;
+    if (Array.isArray(obj["items"])) rawItems = obj["items"];
+    if (Array.isArray(obj["skippedWarrants"])) rawSkipped = obj["skippedWarrants"];
+  } else {
+    console.error("[import-from-photo] Unexpected root type:", typeof parsed);
     return null;
   }
 
-  // Validate and filter each item
+  // Validate items. Only accept 4-5 digit stock/ETF codes; anything 6-char or
+  // with letters gets redirected to skippedWarrants (second-line defence if
+  // Claude misclassifies).
   const items: ParsedHoldingItem[] = [];
-  for (const item of parsed) {
+  const skippedWarrants = new Set<string>();
+
+  for (const item of rawItems) {
     if (
-      typeof item === "object" &&
-      item !== null &&
-      typeof (item as Record<string, unknown>)["symbol"] === "string" &&
-      typeof (item as Record<string, unknown>)["sharesLots"] === "number" &&
-      typeof (item as Record<string, unknown>)["avgCost"] === "number" &&
-      /^\d{4,6}$/.test(String((item as Record<string, unknown>)["symbol"])) &&
-      (item as Record<string, unknown>)["sharesLots"] as number > 0 &&
-      (item as Record<string, unknown>)["avgCost"] as number > 0
+      typeof item !== "object" ||
+      item === null ||
+      typeof (item as Record<string, unknown>)["symbol"] !== "string" ||
+      typeof (item as Record<string, unknown>)["sharesLots"] !== "number" ||
+      typeof (item as Record<string, unknown>)["avgCost"] !== "number" ||
+      !((item as Record<string, unknown>)["sharesLots"] as number > 0) ||
+      !((item as Record<string, unknown>)["avgCost"] as number > 0)
     ) {
+      continue;
+    }
+
+    const symbol = String(
+      (item as Record<string, unknown>)["symbol"]
+    ).toUpperCase();
+
+    if (/^\d{4,5}$/.test(symbol)) {
       items.push({
-        symbol: String((item as Record<string, unknown>)["symbol"]),
+        symbol,
         sharesLots: (item as Record<string, unknown>)["sharesLots"] as number,
         avgCost: (item as Record<string, unknown>)["avgCost"] as number,
       });
+    } else if (/^[0-9A-Z]{5,8}$/.test(symbol)) {
+      // Looks like a warrant slipped into items — salvage it into skipped list
+      skippedWarrants.add(symbol);
+    }
+    // Otherwise: malformed, drop silently
+  }
+
+  for (const s of rawSkipped) {
+    if (typeof s === "string" && s.trim()) {
+      skippedWarrants.add(s.trim().toUpperCase());
     }
   }
 
-  return items;
+  return { items, skippedWarrants: Array.from(skippedWarrants) };
 }

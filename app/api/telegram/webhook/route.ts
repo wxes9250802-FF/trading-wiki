@@ -13,7 +13,7 @@
 export const runtime = "nodejs";
 
 import { NextRequest, NextResponse } from "next/server";
-import { eq, and, isNull, gt, inArray, desc } from "drizzle-orm";
+import { eq, and, isNull, gt, gte, inArray, desc, sql } from "drizzle-orm";
 import { db } from "@/lib/db/client";
 import { createSupabaseAdminClient } from "@/lib/auth/admin";
 import { userProfiles, inviteCodes } from "@/lib/db/schema/users";
@@ -29,10 +29,13 @@ import {
 } from "@/lib/telegram/client";
 import type { TelegramUpdate, TelegramCallbackQuery, TelegramMessage } from "@/lib/telegram/types";
 import { buyHolding, sellHolding, listPortfolio } from "@/lib/holdings/manager";
-import { parseHoldingsPhoto } from "@/lib/holdings/import-from-photo";
+import { parseHoldingsPhoto, type ParsedHoldingItem } from "@/lib/holdings/import-from-photo";
 import { resolveTicker } from "@/lib/ticker/resolver";
+import { classifyTwSymbol } from "@/lib/ticker/classify";
+import { fetchLatestQuote, fetchInstitutionalInvestors } from "@/lib/finmind/client";
 import { holdings as holdingsTable } from "@/lib/db/schema/holdings";
 import { priceAlerts } from "@/lib/db/schema/price-alerts";
+import { tickers } from "@/lib/db/schema/tickers";
 
 const MAX_TEXT_CHARS = 2000;
 const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -129,19 +132,47 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
     return;
   }
 
-  // Holdings import: photo with /import or /匯入 caption
-  const captionCommand = text.toLowerCase();
-  if (captionCommand === "/import" || captionCommand === "/匯入") {
-    const hasPhoto = !!(msg.photo?.length);
-    if (!hasPhoto) {
-      await sendMessage({
-        chat_id: msg.chat.id,
-        text: "❓ 請連同持股截圖一起傳送 /import",
-        parse_mode: "HTML",
-      });
+  // Holdings import: /import or /匯入 — supports three modes:
+  //   1. caption with photo        → Claude Vision
+  //   2. /import + lines of text   → parse each line as "symbol lots price"
+  //   3. /import alone             → show usage help
+  const firstLineRaw = text.split(/\r?\n/)[0]!.trim();
+  const firstWord = firstLineRaw.split(/\s+/)[0]!.toLowerCase();
+  if (firstWord === "/import" || firstWord === "/匯入") {
+    const hasPhotoAttachment = !!(msg.photo?.length);
+    // rest of first line after /import keyword (for single-line usage like
+    // "/import 2330 10 985.5") + all subsequent lines
+    const firstLineRest = firstLineRaw.replace(/^\S+\s*/, "");
+    const bodyLines = [firstLineRest, ...text.split(/\r?\n/).slice(1)];
+    const bodyText = bodyLines.join("\n").trim();
+
+    if (hasPhotoAttachment) {
+      await handleImportPhoto(profile.id, msg.chat.id, msg.photo!);
       return;
     }
-    await handleImportPhoto(profile.id, msg.chat.id, msg.photo!);
+    if (bodyText) {
+      await handleImportText(profile.id, msg.chat.id, bodyLines);
+      return;
+    }
+    await sendMessage({
+      chat_id: msg.chat.id,
+      text: [
+        "❓ <b>/import 用法（擇一）</b>",
+        "",
+        "<b>方式一：文字批次（推薦）</b>",
+        "第一行輸入 <code>/import</code>，接著每行一筆持股：",
+        "<pre>/import",
+        "2330 10 985.5",
+        "1711 2 35",
+        "0050 5 168.2</pre>",
+        "格式：<code>代號 張數 成本</code>（空白或逗號分隔皆可）",
+        "",
+        "<b>方式二：截圖</b>",
+        "上傳持股截圖，caption 寫 <code>/import</code>",
+        "（目前僅支援一般股票與 ETF，權證/期貨會被略過）",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
     return;
   }
 
@@ -279,7 +310,10 @@ async function handleCommand(
           "/buy 代號 張數 成本 — 買入，例如 <code>/buy 2330 10 985.5</code>",
           "/sell 代號 張數 賣價 — 賣出，例如 <code>/sell 2330 5 1050</code>",
           "/portfolio — 查看我的持股與損益",
-          "（傳圖時 caption 寫 /import — 截圖批次匯入）",
+          "/import — 批次匯入持股：",
+          "  • 文字：<code>/import</code> 後每行寫 <code>代號 張數 成本</code>",
+          "  • 截圖：上傳圖片、caption 寫 /import",
+          "  （僅追蹤股票與 ETF；權證會自動略過）",
           "",
           "🔔 <b>盤中警示：</b>",
           "/alert 代號 +漲% -跌% vol 量倍數 — 設定警示條件",
@@ -329,121 +363,12 @@ async function handleCommand(
     }
 
     if (command === "/q") {
-      const parts = rawCommand.trim().split(/\s+/);
-      const rawSymbol = parts[1]?.toUpperCase() ?? "";
-
-      if (!rawSymbol) {
-        await sendMessage({
-          chat_id: chatId,
-          text: "❓ 用法：<code>/q 股票代號</code>\n例如：<code>/q 2330</code>、<code>/q NVDA</code>、<code>/q BTC</code>",
-          parse_mode: "HTML",
-        });
-        return;
-      }
-
-      // Expand bare Taiwan 4-6 digit codes to .TW / .TWO variants
-      const variants: string[] = [rawSymbol];
-      if (/^\d{4,6}$/.test(rawSymbol)) {
-        variants.push(`${rawSymbol}.TW`, `${rawSymbol}.TWO`);
-      }
-
-      const rows = await db
-        .select({
-          sentiment: tipTickers.sentiment,
-          targetPrice: tipTickers.targetPrice,
-          summary: tips.summary,
-          confidence: tips.confidence,
-          market: tips.market,
-          createdAt: tips.createdAt,
-          industryCategory: tips.industryCategory,
-        })
-        .from(tipTickers)
-        .innerJoin(tips, eq(tipTickers.tipId, tips.id))
-        .where(inArray(tipTickers.symbol, variants))
-        .orderBy(desc(tips.createdAt))
-        .limit(20);
-
-      if (rows.length === 0) {
-        await sendMessage({
-          chat_id: chatId,
-          text: `找不到 <b>${rawSymbol}</b> 的情報記錄。\n\n可能原因：\n• 代號不正確（台股請用 4 位數字，如 <code>2330</code>）\n• 尚未有任何情報提及此標的`,
-          parse_mode: "HTML",
-        });
-        return;
-      }
-
-      const total = rows.length;
-      const bullish = rows.filter((r) => r.sentiment === "bullish").length;
-      const bearish = rows.filter((r) => r.sentiment === "bearish").length;
-      const neutral = rows.filter((r) => r.sentiment === "neutral").length;
-
-      // Format recent tips (up to 5)
-      const recentLines = rows.slice(0, 5).map((r) => {
-        const icon =
-          r.sentiment === "bullish" ? "📈" : r.sentiment === "bearish" ? "📉" : "➡️";
-        const date = new Date(r.createdAt).toLocaleDateString("zh-TW", {
-          month: "2-digit",
-          day: "2-digit",
-        });
-        const target = r.targetPrice ? ` 目標 ${parseFloat(r.targetPrice).toLocaleString()}` : "";
-        const conf = r.confidence != null ? ` (${r.confidence}分)` : "";
-        const summary = r.summary ? `\n  ${r.summary}` : "";
-        return `• ${date} ${icon}${target}${conf}${summary}`;
-      });
-
-      // Pick the first available industry category from recent tips
-      const industryCat = rows.find((r) => r.industryCategory)?.industryCategory ?? null;
-      const titleLine = industryCat
-        ? `📊 <b>${rawSymbol} 情報查詢</b> ｜ ${industryCat}`
-        : `📊 <b>${rawSymbol} 情報查詢</b>`;
-
-      const lines = [
-        titleLine,
-        "",
-        `<b>共 ${total} 筆情報</b>`,
-        "",
-        `📈 看多 ${bullish}　📉 看空 ${bearish}　➡️ 中性 ${neutral}`,
-        "",
-        "<b>最近情報：</b>",
-        ...recentLines,
-      ];
-
-      if (total > 5) {
-        lines.push("", `⋯ 顯示最近 5 筆，共 ${total} 筆`);
-      }
-
-      await sendMessage({
-        chat_id: chatId,
-        text: lines.join("\n"),
-        parse_mode: "HTML",
-      });
+      await handleQuery(rawCommand, chatId);
       return;
     }
 
     if (command === "/stats") {
-      const rows = await db
-        .select({ sentiment: tips.sentiment })
-        .from(tips);
-
-      const total = rows.length;
-      const bullish = rows.filter((r) => r.sentiment === "bullish").length;
-      const bearish = rows.filter((r) => r.sentiment === "bearish").length;
-      const neutral = rows.filter((r) => r.sentiment === "neutral").length;
-
-      await sendMessage({
-        chat_id: chatId,
-        text: [
-          "📊 <b>情報總覽</b>",
-          "",
-          `<b>共 ${total} 筆情報</b>`,
-          "",
-          "<b>方向分佈：</b>",
-          `📈 看多：${bullish} 筆`,
-          `📉 看空：${bearish} 筆`,
-          `➡️ 中性：${neutral} 筆`,
-        ].join("\n"),
-        parse_mode: "HTML",
-      });
+      await handleStats(chatId);
       return;
     }
 
@@ -495,6 +420,372 @@ async function handleCommand(
 
 // ─── Holdings: /buy ───────────────────────────────────────────────────────────
 
+// ─── /stats — actionable recent-activity digest ─────────────────────────────
+
+async function handleStats(chatId: number): Promise<void> {
+  const WINDOW_DAYS = 30;
+  const since = new Date(Date.now() - WINDOW_DAYS * 24 * 60 * 60 * 1000);
+
+  // Run independent queries in parallel.
+  const [sentimentRows, topSymbols, topIndustries, recentTips] = await Promise.all([
+    // Overall sentiment counts (last 30d)
+    db
+      .select({ sentiment: tips.sentiment })
+      .from(tips)
+      .where(gte(tips.createdAt, since)),
+
+    // Top 10 mentioned symbols with sentiment breakdown
+    db
+      .select({
+        symbol: tipTickers.symbol,
+        total: sql<number>`count(*)::int`,
+        bullish: sql<number>`count(*) filter (where ${tipTickers.sentiment} = 'bullish')::int`,
+        bearish: sql<number>`count(*) filter (where ${tipTickers.sentiment} = 'bearish')::int`,
+        neutral: sql<number>`count(*) filter (where ${tipTickers.sentiment} = 'neutral')::int`,
+      })
+      .from(tipTickers)
+      .innerJoin(tips, eq(tipTickers.tipId, tips.id))
+      .where(gte(tips.createdAt, since))
+      .groupBy(tipTickers.symbol)
+      .orderBy(desc(sql`count(*)`))
+      .limit(10),
+
+    // Top 5 industries
+    db
+      .select({
+        industry: tips.industryCategory,
+        count: sql<number>`count(*)::int`,
+      })
+      .from(tips)
+      .where(
+        and(
+          gte(tips.createdAt, since),
+          sql`${tips.industryCategory} is not null`,
+          sql`${tips.industryCategory} <> ''`
+        )
+      )
+      .groupBy(tips.industryCategory)
+      .orderBy(desc(sql`count(*)`))
+      .limit(5),
+
+    // Most recent 5 tips
+    db
+      .select({
+        ticker: tips.ticker,
+        sentiment: tips.sentiment,
+        summary: tips.summary,
+        targetPrice: tips.targetPrice,
+        createdAt: tips.createdAt,
+      })
+      .from(tips)
+      .where(gte(tips.createdAt, since))
+      .orderBy(desc(tips.createdAt))
+      .limit(5),
+  ]);
+
+  const total = sentimentRows.length;
+
+  if (total === 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        "📊 <b>情報總覽</b>",
+        "",
+        `近 ${WINDOW_DAYS} 天尚無情報。`,
+        "",
+        "轉傳訊息給本 bot，AI 會自動分類並記錄進資料庫。",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const bullish = sentimentRows.filter((r) => r.sentiment === "bullish").length;
+  const bearish = sentimentRows.filter((r) => r.sentiment === "bearish").length;
+  const neutral = sentimentRows.filter((r) => r.sentiment === "neutral").length;
+
+  // Pre-fetch ticker names for top symbols (one IN query)
+  const topSymbolsList = topSymbols.map((r) => r.symbol);
+  const tickerNameMap = new Map<string, string>();
+  if (topSymbolsList.length > 0) {
+    const nameRows = await db
+      .select({ symbol: tickers.symbol, name: tickers.name })
+      .from(tickers)
+      .where(inArray(tickers.symbol, topSymbolsList));
+    for (const r of nameRows) tickerNameMap.set(r.symbol, r.name);
+  }
+
+  const lines: string[] = [];
+  lines.push(`📊 <b>情報總覽</b>（近 ${WINDOW_DAYS} 天）`);
+  lines.push("");
+  lines.push(`共 <b>${total}</b> 筆　📈 ${bullish}　📉 ${bearish}　➡️ ${neutral}`);
+
+  // Top symbols
+  if (topSymbols.length > 0) {
+    lines.push("");
+    lines.push(`🔥 <b>熱門個股 Top ${topSymbols.length}</b>`);
+    topSymbols.forEach((row, idx) => {
+      const bare = row.symbol.replace(/\.(TW|TWO)$/, "");
+      const name = tickerNameMap.get(row.symbol) ?? "";
+      const tag = name ? ` ${name}` : "";
+      const sentimentParts: string[] = [];
+      if (row.bullish > 0) sentimentParts.push(`📈${row.bullish}`);
+      if (row.bearish > 0) sentimentParts.push(`📉${row.bearish}`);
+      if (row.neutral > 0) sentimentParts.push(`➡️${row.neutral}`);
+      const sentTail = sentimentParts.length > 0 ? ` ｜ ${sentimentParts.join(" ")}` : "";
+      lines.push(`${idx + 1}. <b>${bare}</b>${tag}　${row.total} 次${sentTail}`);
+    });
+  }
+
+  // Top industries
+  if (topIndustries.length > 0) {
+    lines.push("");
+    lines.push("🏭 <b>熱門產業</b>");
+    for (const row of topIndustries) {
+      lines.push(`• ${row.industry} ${row.count} 筆`);
+    }
+  }
+
+  // Recent tips
+  if (recentTips.length > 0) {
+    lines.push("");
+    lines.push("🆕 <b>最新情報</b>");
+    for (const t of recentTips) {
+      const icon =
+        t.sentiment === "bullish" ? "📈" : t.sentiment === "bearish" ? "📉" : "➡️";
+      const date = new Date(t.createdAt).toLocaleDateString("zh-TW", {
+        month: "2-digit",
+        day: "2-digit",
+      });
+      const tkr = t.ticker ? ` <b>${t.ticker.replace(/\.(TW|TWO)$/, "")}</b>` : "";
+      const tgt = t.targetPrice
+        ? ` 目標 ${parseFloat(t.targetPrice).toLocaleString()}`
+        : "";
+      const summary = t.summary ? `\n  ${t.summary}` : "";
+      lines.push(`• ${date}${tkr} ${icon}${tgt}${summary}`);
+    }
+  }
+
+  lines.push("");
+  lines.push("<i>用 /q 代號 查看個股詳細資料</i>");
+
+  await sendMessage({
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+  });
+}
+
+// ─── /q — stock query with live quote + tips ──────────────────────────────────
+
+async function handleQuery(rawCommand: string, chatId: number): Promise<void> {
+  const parts = rawCommand.trim().split(/\s+/);
+  const rawSymbol = parts[1]?.toUpperCase() ?? "";
+
+  if (!rawSymbol) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❓ 用法：<code>/q 股票代號</code>\n例如：<code>/q 2330</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const twKind = classifyTwSymbol(rawSymbol);
+
+  // Expand bare Taiwan 4-5 digit codes to .TW / .TWO variants for tip matching
+  const variants: string[] = [rawSymbol];
+  if (twKind === "stock") {
+    variants.push(`${rawSymbol}.TW`, `${rawSymbol}.TWO`);
+  }
+
+  // Parallel: resolve ticker, fetch quote, fetch tips, fetch institutional
+  const quoteStart = new Date();
+  quoteStart.setDate(quoteStart.getDate() - 5);
+  const quoteStartDate = quoteStart.toISOString().slice(0, 10);
+
+  const [ticker, quote, tipRows, instRows] = await Promise.all([
+    // Only stocks live in tickers DB; warrants bypass resolver
+    twKind === "stock" ? resolveTicker(rawSymbol) : Promise.resolve(null),
+    // FinMind serves both stock and warrant prices
+    twKind === "stock" || twKind === "warrant"
+      ? fetchLatestQuote(rawSymbol)
+      : Promise.resolve(null),
+    db
+      .select({
+        sentiment: tipTickers.sentiment,
+        targetPrice: tipTickers.targetPrice,
+        summary: tips.summary,
+        confidence: tips.confidence,
+        market: tips.market,
+        createdAt: tips.createdAt,
+        industryCategory: tips.industryCategory,
+        companyDescription: tips.companyDescription,
+        sectorPosition: tips.sectorPosition,
+      })
+      .from(tipTickers)
+      .innerJoin(tips, eq(tipTickers.tipId, tips.id))
+      .where(inArray(tipTickers.symbol, variants))
+      .orderBy(desc(tips.createdAt))
+      .limit(20),
+    // Institutional data is meaningful only for stocks, not warrants
+    twKind === "stock"
+      ? fetchInstitutionalInvestors(rawSymbol, quoteStartDate)
+      : Promise.resolve(null),
+  ]);
+
+  // If nothing at all — no price, no tips, no ticker match — report not found
+  if (!ticker && !quote && tipRows.length === 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        `❓ 找不到 <b>${rawSymbol}</b> 的任何資料。`,
+        "",
+        "可能原因：",
+        "• 代號格式錯誤（台股請用 4 位數字，如 <code>2330</code>）",
+        "• 該股票未被納入系統資料源",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // ── Build header: symbol + name + industry ─────────────────────────────────
+  const displayName = ticker?.name ?? "";
+  const industryCat =
+    tipRows.find((r) => r.industryCategory)?.industryCategory ?? null;
+
+  const headerParts = [`📊 <b>${rawSymbol}</b>`];
+  if (displayName) headerParts.push(displayName);
+  if (twKind === "warrant") headerParts.push("（權證）");
+  const header = industryCat
+    ? `${headerParts.join(" ")} ｜ ${industryCat}`
+    : headerParts.join(" ");
+
+  const lines: string[] = [header];
+
+  // ── Live quote block ──────────────────────────────────────────────────────
+  if (quote) {
+    const dateLabel = quote.date.slice(5); // "MM-DD"
+    const pctStr =
+      quote.changePct !== null
+        ? `${quote.changePct >= 0 ? "+" : ""}${quote.changePct.toFixed(2)}%`
+        : "—";
+    const absStr =
+      quote.changeAbs !== null
+        ? `${quote.changeAbs >= 0 ? "+" : ""}${quote.changeAbs.toFixed(2)}`
+        : "";
+    const arrow =
+      quote.changePct === null
+        ? ""
+        : quote.changePct > 0
+        ? "🔺"
+        : quote.changePct < 0
+        ? "🔻"
+        : "▪️";
+
+    const volLots = Math.round(quote.volume / 1000);
+    lines.push("");
+    lines.push(
+      `${arrow} 現價 <b>${quote.close.toFixed(2)}</b>　${absStr ? absStr + "（" : ""}${pctStr}${absStr ? "）" : ""}`
+    );
+    lines.push(
+      `　高 ${quote.high.toFixed(2)}　低 ${quote.low.toFixed(2)}　量 ${volLots.toLocaleString()} 張`
+    );
+    lines.push(`　資料日 ${dateLabel}`);
+  }
+
+  // ── Institutional block (latest trading day only) ─────────────────────────
+  if (instRows && instRows.length > 0) {
+    // Group by date, take latest date
+    const byDate = new Map<string, typeof instRows>();
+    for (const r of instRows) {
+      const arr = byDate.get(r.date) ?? [];
+      arr.push(r);
+      byDate.set(r.date, arr);
+    }
+    const latestDate = Array.from(byDate.keys()).sort().pop();
+    if (latestDate) {
+      const rows = byDate.get(latestDate)!;
+      const netByGroup = {
+        foreign: 0,  // Foreign_Investor + Foreign_Dealer_Self
+        trust: 0,    // Investment_Trust
+        dealer: 0,   // Dealer_self + Dealer_Hedging
+      };
+      for (const r of rows) {
+        const net = Math.round((r.buy - r.sell) / 1000); // 張
+        if (r.name === "Foreign_Investor" || r.name === "Foreign_Dealer_Self") {
+          netByGroup.foreign += net;
+        } else if (r.name === "Investment_Trust") {
+          netByGroup.trust += net;
+        } else {
+          netByGroup.dealer += net;
+        }
+      }
+      const fmt = (n: number) => (n >= 0 ? `+${n.toLocaleString()}` : n.toLocaleString());
+      lines.push("");
+      lines.push(
+        `<b>三大法人</b>（${latestDate.slice(5)}，張）`
+      );
+      lines.push(
+        `　外資 ${fmt(netByGroup.foreign)}　投信 ${fmt(netByGroup.trust)}　自營 ${fmt(netByGroup.dealer)}`
+      );
+    }
+  }
+
+  // ── Tips block ────────────────────────────────────────────────────────────
+  if (tipRows.length > 0) {
+    const total = tipRows.length;
+    const bullish = tipRows.filter((r) => r.sentiment === "bullish").length;
+    const bearish = tipRows.filter((r) => r.sentiment === "bearish").length;
+    const neutral = tipRows.filter((r) => r.sentiment === "neutral").length;
+
+    lines.push("");
+    lines.push(`<b>本站情報（${total} 筆）</b>`);
+    lines.push(`　📈 看多 ${bullish}　📉 看空 ${bearish}　➡️ 中性 ${neutral}`);
+
+    const recentLines = tipRows.slice(0, 5).map((r) => {
+      const icon =
+        r.sentiment === "bullish" ? "📈" : r.sentiment === "bearish" ? "📉" : "➡️";
+      const date = new Date(r.createdAt).toLocaleDateString("zh-TW", {
+        month: "2-digit",
+        day: "2-digit",
+      });
+      const target = r.targetPrice
+        ? ` 目標 ${parseFloat(r.targetPrice).toLocaleString()}`
+        : "";
+      const conf = r.confidence != null ? ` (${r.confidence}分)` : "";
+      const summary = r.summary ? `\n  ${r.summary}` : "";
+      return `• ${date} ${icon}${target}${conf}${summary}`;
+    });
+
+    lines.push("");
+    lines.push("<b>最近情報：</b>");
+    lines.push(...recentLines);
+
+    if (total > 5) {
+      lines.push("");
+      lines.push(`⋯ 顯示最近 5 筆，共 ${total} 筆`);
+    }
+
+    // Pick a company description if any
+    const desc = tipRows.find((r) => r.companyDescription)?.companyDescription;
+    if (desc) {
+      lines.push("");
+      lines.push(`💼 ${desc}`);
+    }
+  } else if (ticker || quote) {
+    lines.push("");
+    lines.push("<i>本站目前沒有此股的情報記錄。</i>");
+  }
+
+  await sendMessage({
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+  });
+}
+
 async function handleBuy(
   rawCommand: string,
   userId: string,
@@ -515,11 +806,24 @@ async function handleBuy(
     return;
   }
 
-  // 只接受台股 4-6 位代碼
-  if (!/^\d{4,6}$/.test(rawSymbol)) {
+  const symbolUpper = rawSymbol.toUpperCase();
+  const kind = classifyTwSymbol(symbolUpper);
+  if (kind === "warrant") {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 股票代號格式錯誤，請輸入 4-6 位台股代碼，例如 <code>2330</code>",
+      text: [
+        "ℹ️ <b>本系統不追蹤權證</b>",
+        "",
+        "權證因到期日與高波動特性，不納入持倉管理。",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  if (kind !== "stock") {
+    await sendMessage({
+      chat_id: chatId,
+      text: "❌ 代號格式錯誤，請輸入台股 4-5 位數字，例如 <code>2330</code>、<code>00878</code>",
       parse_mode: "HTML",
     });
     return;
@@ -546,23 +850,21 @@ async function handleBuy(
     return;
   }
 
-  // 正規化 symbol：查 tickers 表
-  const ticker = await resolveTicker(rawSymbol);
-  const symbol = ticker?.symbol ?? `${rawSymbol}.TW`;
-  const displayName = ticker?.name ?? rawSymbol;
+  const ticker = await resolveTicker(symbolUpper);
+  const symbol = ticker?.symbol ?? `${symbolUpper}.TW`;
+  const displayName = ticker?.name ?? symbolUpper;
 
   try {
     const result = await buyHolding({ userId, symbol, sharesLots, price });
     await sendMessage({
       chat_id: chatId,
       text: [
-        `✅ 已記錄 買入 ${rawSymbol} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
+        `✅ 已記錄 買入 ${symbolUpper} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
         `持股更新為 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`,
       ].join("\n"),
       parse_mode: "HTML",
     });
 
-    // Only prompt if user has no alert for this symbol yet
     const [existing] = await db
       .select({ id: priceAlerts.id })
       .from(priceAlerts)
@@ -602,10 +904,12 @@ async function handleSell(
     return;
   }
 
-  if (!/^\d{4,6}$/.test(rawSymbol)) {
+  const symbolUpper = rawSymbol.toUpperCase();
+  const kind = classifyTwSymbol(symbolUpper);
+  if (kind !== "stock") {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 股票代號格式錯誤，請輸入 4-6 位台股代碼，例如 <code>2330</code>",
+      text: "❌ 代號格式錯誤，請輸入台股 4-5 位數字，例如 <code>2330</code>",
       parse_mode: "HTML",
     });
     return;
@@ -632,9 +936,9 @@ async function handleSell(
     return;
   }
 
-  const ticker = await resolveTicker(rawSymbol);
-  const symbol = ticker?.symbol ?? `${rawSymbol}.TW`;
-  const displayName = ticker?.name ?? rawSymbol;
+  const ticker = await resolveTicker(symbolUpper);
+  const symbol = ticker?.symbol ?? `${symbolUpper}.TW`;
+  const displayName = ticker?.name ?? symbolUpper;
 
   try {
     // 先查均價（用於計算實現損益）
@@ -888,10 +1192,24 @@ async function handleAlertSet(
   }
 
   const rawSymbol = rawSymbolToken.toUpperCase();
-  if (!/^\d{4,6}$/.test(rawSymbol)) {
+  const kind = classifyTwSymbol(rawSymbol);
+  if (kind === "unknown") {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 代號格式錯誤，台股請用 4-6 位數字，例如 <code>2330</code>",
+      text: "❌ 代號格式錯誤，台股請用 4-5 位數字，例如 <code>2330</code>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+  if (kind === "warrant") {
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        "⚠️ <b>權證不支援盤中警示</b>",
+        "",
+        "權證單日波動可能達數十 %，固定 % 門檻容易持續誤觸發。",
+        "如需追價請自行於券商 APP 設定。",
+      ].join("\n"),
       parse_mode: "HTML",
     });
     return;
@@ -1269,24 +1587,161 @@ async function handleImportPhoto(
     parse_mode: "HTML",
   });
 
-  const rawItems = await parseHoldingsPhoto(base64);
+  const parsed = await parseHoldingsPhoto(base64);
 
-  if (!rawItems || rawItems.length === 0) {
+  if (!parsed || (parsed.items.length === 0 && parsed.skippedWarrants.length === 0)) {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 無法從截圖辨識持股資料，請確認是台股券商 APP 的持股明細頁面。",
+      text: [
+        "❌ <b>截圖中未找到可匯入的持股</b>",
+        "",
+        "可能原因：",
+        "• 截圖模糊或不是持股明細頁",
+        "• 畫面全為期貨、基金等不支援的標的",
+        "",
+        "💡 <b>可改用文字批次匯入：</b>",
+        "<pre>/import",
+        "2330 10 985.5",
+        "1711 2 35</pre>",
+      ].join("\n"),
       parse_mode: "HTML",
     });
     return;
   }
 
-  // Hard cap: AI hallucination defence. One screenshot realistically <= 30 items.
+  if (parsed.items.length === 0 && parsed.skippedWarrants.length > 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        "ℹ️ <b>截圖中只有權證，沒有可匯入的股票</b>",
+        "",
+        `已識別但略過的權證：<code>${parsed.skippedWarrants.slice(0, 10).join(", ")}</code>`,
+        "",
+        "本系統目前只追蹤一般股票與 ETF。",
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  await createImportPreview(
+    userId,
+    chatId,
+    parsed.items,
+    "screenshot",
+    [],
+    parsed.skippedWarrants
+  );
+}
+
+// ─── Holdings: text-based /import ─────────────────────────────────────────────
+
+/**
+ * Parse multi-line text after `/import`. Each non-empty, non-comment line should
+ * be `symbol lots price` (separated by whitespace, comma, or tab). Returns
+ * valid items plus the raw lines that failed to parse (for user feedback).
+ */
+function parseImportTextLines(lines: string[]): {
+  items: ParsedHoldingItem[];
+  invalid: string[];
+  skippedWarrants: string[];
+} {
+  const items: ParsedHoldingItem[] = [];
+  const invalid: string[] = [];
+  const skippedWarrants: string[] = [];
+
+  for (const rawLine of lines) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    if (line.startsWith("#") || line.startsWith("//")) continue;
+
+    const parts = line.split(/[\s,\t]+/).filter(Boolean);
+    if (parts.length < 3) {
+      invalid.push(line);
+      continue;
+    }
+
+    const [symbolRaw, lotsRaw, priceRaw] = parts;
+    const symbol = symbolRaw!.toUpperCase();
+
+    const kind = classifyTwSymbol(symbol);
+    if (kind === "warrant") {
+      skippedWarrants.push(symbol);
+      continue;
+    }
+    if (kind !== "stock") {
+      invalid.push(line);
+      continue;
+    }
+
+    const sharesLots = parseFloat(lotsRaw!);
+    const price = parseFloat(priceRaw!);
+
+    if (!isFinite(sharesLots) || sharesLots <= 0 || !isFinite(price) || price <= 0) {
+      invalid.push(line);
+      continue;
+    }
+
+    items.push({ symbol, sharesLots, avgCost: price });
+  }
+
+  return { items, invalid, skippedWarrants };
+}
+
+async function handleImportText(
+  userId: string,
+  chatId: number,
+  lines: string[]
+): Promise<void> {
+  const { items, invalid, skippedWarrants } = parseImportTextLines(lines);
+
+  if (items.length === 0) {
+    const warrantNote =
+      skippedWarrants.length > 0
+        ? `\n\n⚠️ 已略過 ${skippedWarrants.length} 檔權證（${skippedWarrants.slice(0, 5).join(", ")}）：本系統不追蹤權證。`
+        : "";
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        "❌ <b>沒有可匯入的項目</b>",
+        "",
+        invalid.length > 0
+          ? `無法解析的行（共 ${invalid.length} 行）：\n<code>${escapeHtml(invalid.slice(0, 5).join("\n"))}</code>`
+          : "請確認每行格式為 <code>代號 張數 成本</code>",
+        "",
+        "<b>範例：</b>",
+        "<pre>/import",
+        "2330 10 985.5",
+        "1711 2 35</pre>",
+      ].join("\n") + warrantNote,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  await createImportPreview(userId, chatId, items, "text", invalid, skippedWarrants);
+}
+
+// ─── Holdings: shared preview + pending_imports writer ───────────────────────
+
+/**
+ * Shared preview flow for photo and text import. Caps items at 50, writes
+ * pending_imports (replacing any prior), and sends the confirm/cancel buttons.
+ */
+async function createImportPreview(
+  userId: string,
+  chatId: number,
+  rawItems: ParsedHoldingItem[],
+  source: "screenshot" | "text",
+  invalid: string[] = [],
+  skippedWarrants: string[] = []
+): Promise<void> {
+  // Hard cap: AI hallucination / copy-paste defence. 50 items covers any real portfolio.
   const items = rawItems.slice(0, 50);
 
   // Remove any prior pending imports from this user — only one active at a time
   await db.delete(pendingImports).where(eq(pendingImports.userId, userId));
 
-  // Store in pending_imports
   const [pending] = await db
     .insert(pendingImports)
     .values({
@@ -1304,7 +1759,6 @@ async function handleImportPhoto(
     return;
   }
 
-  // Format preview
   const previewLines = items.map((item, idx) => {
     const lotsStr = item.sharesLots % 1 === 0
       ? String(item.sharesLots)
@@ -1312,15 +1766,28 @@ async function handleImportPhoto(
     return `${idx + 1}. ${item.symbol}　${lotsStr} 張　@${item.avgCost.toFixed(2)}`;
   });
 
+  const header =
+    source === "screenshot"
+      ? "📋 <b>從截圖辨識到以下持股，請確認是否匯入：</b>"
+      : "📋 <b>從文字解析到以下持股，請確認是否匯入：</b>";
+
+  const bodyLines: string[] = [header, "", ...previewLines];
+  if (skippedWarrants.length > 0) {
+    bodyLines.push("");
+    bodyLines.push(
+      `⚠️ 已略過 ${skippedWarrants.length} 檔權證（${skippedWarrants.slice(0, 3).join(", ")}${skippedWarrants.length > 3 ? "…" : ""}）：本系統不追蹤權證`
+    );
+  }
+  if (invalid.length > 0) {
+    bodyLines.push("");
+    bodyLines.push(`⚠️ 已略過 ${invalid.length} 行無法解析的輸入`);
+  }
+  bodyLines.push("");
+  bodyLines.push("請按下方按鈕確認或取消。");
+
   await sendMessage({
     chat_id: chatId,
-    text: [
-      "📋 <b>從截圖辨識到以下持股，請確認是否匯入：</b>",
-      "",
-      ...previewLines,
-      "",
-      "請按下方按鈕確認或取消。",
-    ].join("\n"),
+    text: bodyLines.join("\n"),
     parse_mode: "HTML",
     reply_markup: {
       inline_keyboard: [
@@ -1331,6 +1798,13 @@ async function handleImportPhoto(
       ],
     },
   });
+}
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 // ─── T14: Telegram invite redemption (/start CODE) ───────────────────────────
@@ -1642,10 +2116,15 @@ async function handleImportCallback(
   // confirm: write to holdings
   const items = pending.payload as PendingImportItem[];
 
-  // Pre-resolve all symbols so we can reject unknown ones BEFORE writing anything.
-  // This prevents partial success with the wrong suffix (e.g. guessing .TW when
-  // the stock is actually .TWO), and lets us present a single confirm/reject.
-  type ResolvedItem = { symbol: string; sharesLots: number; avgCost: number; rawSymbol: string };
+  // Pre-resolve all symbols. Warrants and non-stock formats should have been
+  // filtered upstream (photo parser + text parser), so any row that fails
+  // resolver here is genuinely unknown.
+  type ResolvedItem = {
+    symbol: string;
+    sharesLots: number;
+    avgCost: number;
+    rawSymbol: string;
+  };
   const resolved: ResolvedItem[] = [];
   const unresolved: string[] = [];
   for (const item of items) {
@@ -1675,9 +2154,9 @@ async function handleImportCallback(
       text: [
         "❌ <b>匯入已取消</b>",
         "",
-        `以下代號找不到對應股票：<code>${unresolved.join(", ")}</code>`,
+        `以下代號無法對應：<code>${unresolved.join(", ")}</code>`,
         "",
-        "請確認代號正確，或稍後重傳截圖。",
+        "請確認代號格式：股票 4-5 位數、權證 6 字元。",
       ].join("\n"),
       parse_mode: "HTML",
     });
@@ -1723,7 +2202,7 @@ async function handleImportCallback(
     parse_mode: "HTML",
   });
 
-  // ── Alert setup prompts — one inline-keyboard per newly imported symbol ──
+  // ── Alert setup prompts — one inline-keyboard per newly imported stock ──
   // Only prompt for symbols the user doesn't already have an alert on.
   if (successCount > 0) {
     for (const r of resolved) {
