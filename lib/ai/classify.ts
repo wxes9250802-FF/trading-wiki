@@ -1,5 +1,6 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
+import { toTraditional } from "@/lib/util/chinese";
 
 // ─── Model ────────────────────────────────────────────────────────────────────
 
@@ -62,7 +63,9 @@ export interface ClassifyMedia {
 
 const SYSTEM_PROMPT = `你是一個台股交易情報分析師。分析以下 Telegram 訊息，判斷是否包含有效的台股交易建議。
 
-【重要前提】本系統只處理台股（上市 + 上櫃），非台股內容一律回覆 is_tip: false。
+【重要前提】
+- 本系統只處理台股（上市 + 上櫃），非台股內容一律回覆 is_tip: false。
+- 所有輸出文字（summary / company_description / sector_position）**一律使用台灣慣用繁體中文**，禁止任何簡體字、禁止大陸用詞（例如請用「軟體」不要用「軟件」、「網路」不要用「網絡」、「品質」不要用「質量」、「滑鼠」不要用「鼠標」）。來源訊息若為簡體字，輸出時也要轉為繁體中文。
 
 【如果是台股交易情報】回覆此 JSON（不含其他文字）：
 {
@@ -177,8 +180,21 @@ export async function classifyMessage(
     );
   }
 
+  // Safety net: normalise AI-generated Chinese fields to Traditional (twp).
+  // Haiku occasionally emits simplified glyphs ("目标价") despite the prompt.
+  const data = validation.data;
+  if (data.is_tip) {
+    data.summary = toTraditional(data.summary);
+    if (data.company_description) {
+      data.company_description = toTraditional(data.company_description);
+    }
+    if (data.sector_position) {
+      data.sector_position = toTraditional(data.sector_position);
+    }
+  }
+
   return {
-    result: validation.data,
+    result: data,
     model,
     inputTokens,
     outputTokens,

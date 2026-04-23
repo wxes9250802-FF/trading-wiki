@@ -25,6 +25,7 @@ import { eq, inArray, isNotNull } from "drizzle-orm";
 import Anthropic from "@anthropic-ai/sdk";
 import { db } from "@/lib/db/client";
 import { tips } from "@/lib/db/schema/tips";
+import { toTraditional } from "@/lib/util/chinese";
 
 const DRY_RUN = (process.env["DRY_RUN"] ?? "").toLowerCase() === "true";
 const MIN_GROUP_SIZE = Math.max(2, parseInt(process.env["MIN_GROUP_SIZE"] ?? "2", 10));
@@ -46,7 +47,9 @@ const SYSTEM_PROMPT = `你是一個情報整合助手。下面會給你一組關
 1. 辨識哪些情報在講**同一則新聞、同一個題材、同一個事件**（語意相同就算，不需字面相同）
 2. 每個「同一件事」歸成一個 cluster，給一個簡短 topic 名稱
 3. 每個 cluster 選一個 keep_id（選摘要最完整、資訊最豐富的那筆）
-4. 若 cluster 有多筆，寫一個 merged_summary：把所有筆的獨特資訊整合成一句（繁體中文，100 字以內，不要丟失細節）
+4. 若 cluster 有多筆，寫一個 merged_summary：把所有筆的獨特資訊整合成一句（100 字以內，不要丟失細節）
+   - **必須使用台灣慣用繁體中文**（例：「軟體」非「軟件」、「網路」非「網絡」）
+   - 禁止任何簡體字
 5. 只有一筆的 cluster，merged_summary 設為 null
 
 **判定標準**：
@@ -137,10 +140,11 @@ async function clusterTips(
     if (!keep_id || tip_ids.length === 0) continue;
     if (!tip_ids.includes(keep_id)) continue;
     clusters.push({
-      topic: c.topic ?? "(no topic)",
+      topic: toTraditional(c.topic ?? "(no topic)"),
       tip_ids,
       keep_id,
-      merged_summary: c.merged_summary ?? null,
+      // Safety net: force Traditional even if Haiku misbehaves
+      merged_summary: c.merged_summary ? toTraditional(c.merged_summary) : null,
     });
   }
 
