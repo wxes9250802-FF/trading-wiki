@@ -15,6 +15,7 @@
     "db:studio": "drizzle-kit studio",
     "db:sync-tickers": "bun run scripts/sync-tickers.ts",
     "telegram:register": "bun run scripts/register-webhook.ts",
+    "telegram:register-commands": "bun run scripts/register-bot-commands.ts",
     "ai:classify": "bun run scripts/classify-messages.ts",
     "ai:verify": "bun run scripts/verify-tips.ts",
     "bootstrap:admin": "bun run scripts/bootstrap-admin.ts",
