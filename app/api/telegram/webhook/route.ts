@@ -36,6 +36,8 @@ import { fetchLatestQuote, fetchInstitutionalInvestors } from "@/lib/finmind/cli
 import { holdings as holdingsTable } from "@/lib/db/schema/holdings";
 import { priceAlerts } from "@/lib/db/schema/price-alerts";
 import { tickers } from "@/lib/db/schema/tickers";
+import { pendingSells } from "@/lib/db/schema/pending-sells";
+import { fetchCurrentPrice } from "@/lib/price/client";
 
 const MAX_TEXT_CHARS = 2000;
 const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -130,6 +132,15 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
       parse_mode: "HTML",
     });
     return;
+  }
+
+  // Interactive /sell continuation: bare number reply consumes pending_sell.
+  // Must run BEFORE command + import routing so "3" alone doesn't fall through.
+  // Only triggers when user has a non-expired pending_sell and the text is a
+  // pure number; otherwise this is a no-op and we fall through.
+  if (!msg.photo?.length && msg.document === undefined && /^\d+(\.\d+)?$/.test(text)) {
+    const consumed = await tryConsumePendingSellFromText(profile.id, msg.chat.id, text);
+    if (consumed) return;
   }
 
   // Holdings import: /import or /匯入 — supports three modes:
@@ -308,7 +319,9 @@ async function handleCommand(
           "",
           "📦 <b>持股管理：</b>",
           "/buy 代號 張數 成本 — 買入，例如 <code>/buy 2330 10 985.5</code>",
-          "/sell 代號 張數 賣價 — 賣出，例如 <code>/sell 2330 5 1050</code>",
+          "/sell — 互動選單（選持股 → 選張數，用 FinMind 現價）",
+          "/sell 代號 張數 賣價 — 指定價賣出，例如 <code>/sell 2330 5 1050</code>",
+          "/clear — 一鍵清倉（全數以現價賣出）",
           "/portfolio — 查看我的持股與損益",
           "/import — 批次匯入持股：",
           "  • 文字：<code>/import</code> 後每行寫 <code>代號 張數 成本</code>",
@@ -384,6 +397,11 @@ async function handleCommand(
 
     if (command === "/portfolio") {
       await handlePortfolio(profile.id, chatId);
+      return;
+    }
+
+    if (command === "/clear" || command === "/清倉") {
+      await handleClearPrompt(profile.id, chatId);
       return;
     }
 
@@ -895,10 +913,22 @@ async function handleSell(
   const rawLots = parts[2] ?? "";
   const rawPrice = parts[3] ?? "";
 
-  if (!rawSymbol || !rawLots || !rawPrice) {
+  // No args → interactive menu mode (pick a holding, then qty)
+  if (!rawSymbol) {
+    await handleSellInteractiveList(userId, chatId);
+    return;
+  }
+
+  // Symbol only (no lots / price) → also route to interactive for that symbol
+  if (!rawLots || !rawPrice) {
     await sendMessage({
       chat_id: chatId,
-      text: "❓ 用法：<code>/sell 代號 張數 賣價</code>\n例如：<code>/sell 2330 5 1050</code>",
+      text: [
+        "❓ 用法：",
+        "• 互動模式：直接輸入 <code>/sell</code>（選持股 → 選張數）",
+        "• 指令模式：<code>/sell 代號 張數 賣價</code>",
+        "  例：<code>/sell 2330 5 1050</code>",
+      ].join("\n"),
       parse_mode: "HTML",
     });
     return;
@@ -1093,6 +1123,643 @@ async function handlePortfolio(userId: string, chatId: number): Promise<void> {
       text: "⚠️ 查詢持股失敗，請稍後再試。",
       parse_mode: "HTML",
     });
+  }
+}
+
+// ─── Holdings: /clear — one-click liquidation ────────────────────────────────
+
+async function handleClearPrompt(userId: string, chatId: number): Promise<void> {
+  const rows = await listPortfolio(userId);
+
+  if (rows.length === 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "📭 你目前沒有任何持股",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const lines: string[] = [
+    "⚠️ <b>一鍵清倉確認</b>",
+    "",
+    `你目前持有 <b>${rows.length}</b> 檔：`,
+    "",
+  ];
+
+  let totalCost = 0;
+  for (let i = 0; i < rows.length; i++) {
+    const r = rows[i]!;
+    const bare = r.symbol.replace(/\.(TW|TWO)$/, "");
+    const lotsStr = r.sharesLots % 1 === 0 ? String(r.sharesLots) : r.sharesLots.toFixed(1);
+    lines.push(`${i + 1}. ${bare} ${lotsStr} 張 @均價 ${r.avgCost.toFixed(2)}`);
+    totalCost += r.costBasis;
+  }
+
+  lines.push("");
+  lines.push(`總成本：NT$${totalCost.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}`);
+  lines.push("");
+  lines.push("按下確認後，將以<b>執行當下的 FinMind 市價</b>全數賣出（含移除對應警示）。");
+
+  await sendMessage({
+    chat_id: chatId,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          { text: "✅ 確認全部清倉", callback_data: "clear:confirm" },
+          { text: "❌ 取消", callback_data: "clear:cancel" },
+        ],
+      ],
+    },
+  });
+}
+
+async function handleClearCallback(
+  query: TelegramCallbackQuery,
+  data: string
+): Promise<void> {
+  const action = data.split(":")[1];
+
+  // Strip buttons immediately to prevent double-tap
+  if (query.message) {
+    await editMessageReplyMarkup({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
+  }
+
+  if (action === "cancel") {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "已取消清倉",
+    });
+    await sendMessage({
+      chat_id: query.from.id,
+      text: "❌ <b>已取消清倉</b>",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Shortcut from /sell interactive menu → show the confirm prompt instead
+  if (action === "prompt") {
+    const [profile] = await db
+      .select({ id: userProfiles.id })
+      .from(userProfiles)
+      .where(eq(userProfiles.telegramId, query.from.id))
+      .limit(1);
+    if (!profile) {
+      await answerCallbackQuery({ callback_query_id: query.id, text: "找不到帳號" });
+      return;
+    }
+    await answerCallbackQuery({ callback_query_id: query.id });
+    await handleClearPrompt(profile.id, query.from.id);
+    return;
+  }
+
+  if (action !== "confirm") {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+
+  // Resolve user
+  const [profile] = await db
+    .select({ id: userProfiles.id })
+    .from(userProfiles)
+    .where(eq(userProfiles.telegramId, query.from.id))
+    .limit(1);
+
+  if (!profile) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "找不到帳號",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const rows = await listPortfolio(profile.id);
+  if (rows.length === 0) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "持倉已空",
+    });
+    await sendMessage({
+      chat_id: query.from.id,
+      text: "ℹ️ 持倉已經是空的，無需清倉。",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  await answerCallbackQuery({
+    callback_query_id: query.id,
+    text: `🔄 正在清倉 ${rows.length} 檔…`,
+  });
+
+  type LiquidationResult =
+    | { ok: true; symbol: string; lots: number; price: number; pnl: number }
+    | { ok: false; symbol: string; reason: string };
+
+  const results: LiquidationResult[] = [];
+
+  for (const r of rows) {
+    // Prefer the price listPortfolio already fetched; fall back to a live lookup
+    const price = r.currentPrice ?? (await fetchCurrentPrice(r.symbol));
+    if (!price) {
+      results.push({ ok: false, symbol: r.symbol, reason: "取不到市價" });
+      continue;
+    }
+    try {
+      await sellHolding({
+        userId: profile.id,
+        symbol: r.symbol,
+        sharesLots: r.sharesLots,
+        price,
+        note: "一鍵清倉",
+      });
+      // Remove any alert for this symbol (position is gone)
+      await db
+        .delete(priceAlerts)
+        .where(
+          and(
+            eq(priceAlerts.userId, profile.id),
+            eq(priceAlerts.symbol, r.symbol)
+          )
+        );
+      const pnl = (price - r.avgCost) * r.sharesLots * 1000;
+      results.push({
+        ok: true,
+        symbol: r.symbol,
+        lots: r.sharesLots,
+        price,
+        pnl,
+      });
+    } catch (err) {
+      console.error("[clear] sell failed:", err);
+      results.push({
+        ok: false,
+        symbol: r.symbol,
+        reason: err instanceof Error ? err.message : "未知錯誤",
+      });
+    }
+  }
+
+  const succeeded = results.filter((r): r is Extract<LiquidationResult, { ok: true }> => r.ok);
+  const failed = results.filter((r): r is Extract<LiquidationResult, { ok: false }> => !r.ok);
+
+  const totalPnl = succeeded.reduce((sum, r) => sum + r.pnl, 0);
+  const pnlSign = totalPnl >= 0 ? "+" : "";
+
+  const lines: string[] = [];
+  lines.push(`✅ <b>清倉完成</b>（成功 ${succeeded.length} / 失敗 ${failed.length}）`);
+  lines.push("");
+
+  if (succeeded.length > 0) {
+    for (const s of succeeded) {
+      const bare = s.symbol.replace(/\.(TW|TWO)$/, "");
+      const lotsStr = s.lots % 1 === 0 ? String(s.lots) : s.lots.toFixed(1);
+      const pSign = s.pnl >= 0 ? "+" : "";
+      lines.push(
+        `• ${bare} ${lotsStr} 張 @${s.price.toFixed(2)}　${pSign}NT$${Math.abs(Math.round(s.pnl)).toLocaleString()}`
+      );
+    }
+    lines.push("");
+    lines.push(
+      `<b>實現總損益：${pnlSign}NT$${Math.abs(Math.round(totalPnl)).toLocaleString()}</b>`
+    );
+  }
+
+  if (failed.length > 0) {
+    lines.push("");
+    lines.push("⚠️ <b>未賣出：</b>");
+    for (const f of failed) {
+      const bare = f.symbol.replace(/\.(TW|TWO)$/, "");
+      lines.push(`• ${bare} — ${f.reason}`);
+    }
+    lines.push("");
+    lines.push("請用 <code>/sell 代號 張數 賣價</code> 手動處理上述標的。");
+  }
+
+  await sendMessage({
+    chat_id: query.from.id,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+  });
+}
+
+// ─── Holdings: interactive /sell flow ────────────────────────────────────────
+
+const PENDING_SELL_TTL_MS = 5 * 60 * 1000; // 5 minutes
+
+/** Show the list of holdings as inline-keyboard buttons, one per row. */
+async function handleSellInteractiveList(
+  userId: string,
+  chatId: number
+): Promise<void> {
+  const rows = await listPortfolio(userId);
+
+  if (rows.length === 0) {
+    await sendMessage({
+      chat_id: chatId,
+      text: "📭 你目前沒有任何持股",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  const keyboard: { text: string; callback_data: string }[][] = rows.map((r) => {
+    const bare = r.symbol.replace(/\.(TW|TWO)$/, "");
+    const lotsStr = r.sharesLots % 1 === 0 ? String(r.sharesLots) : r.sharesLots.toFixed(1);
+    const priceTail = r.currentPrice !== null
+      ? ` 現價 ${r.currentPrice.toFixed(2)}`
+      : "";
+    return [
+      {
+        text: `${bare} ${lotsStr}張${priceTail}`,
+        // callback_data must be ≤64 bytes; symbols are short so this is fine
+        callback_data: `sell:${r.symbol}`,
+      },
+    ];
+  });
+
+  // Divider + "clear all" shortcut
+  keyboard.push([{ text: "✖ 全部清倉 (/clear)", callback_data: "clear:prompt" }]);
+
+  await sendMessage({
+    chat_id: chatId,
+    text: [
+      "📊 <b>選擇要賣出的持股：</b>",
+      "",
+      "或用指令模式：<code>/sell 代號 張數 賣價</code>",
+    ].join("\n"),
+    parse_mode: "HTML",
+    reply_markup: { inline_keyboard: keyboard },
+  });
+}
+
+/**
+ * User tapped a holding button from the sell list.
+ * Fetch current price, upsert a pending_sell row, then show the qty buttons.
+ */
+async function handleSellPickCallback(
+  query: TelegramCallbackQuery,
+  data: string
+): Promise<void> {
+  const symbol = data.slice("sell:".length);
+  if (!symbol) {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+
+  const [profile] = await db
+    .select({ id: userProfiles.id })
+    .from(userProfiles)
+    .where(eq(userProfiles.telegramId, query.from.id))
+    .limit(1);
+
+  if (!profile) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "找不到帳號",
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Verify the user still holds this symbol, fetch lots + avg cost
+  const [holding] = await db
+    .select({
+      sharesLots: holdingsTable.sharesLots,
+      avgCost: holdingsTable.avgCost,
+    })
+    .from(holdingsTable)
+    .where(and(eq(holdingsTable.userId, profile.id), eq(holdingsTable.symbol, symbol)))
+    .limit(1);
+
+  if (!holding) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "已無此持股",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const sharesLotsHeld = parseFloat(holding.sharesLots);
+  const avgCost = parseFloat(holding.avgCost);
+
+  // Strip buttons from the list message
+  if (query.message) {
+    await editMessageReplyMarkup({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
+  }
+
+  const price = await fetchCurrentPrice(symbol);
+  if (!price) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "取不到現價",
+      show_alert: true,
+    });
+    await sendMessage({
+      chat_id: query.from.id,
+      text: `⚠️ 取不到 ${symbol.replace(/\.(TW|TWO)$/, "")} 的市價，請改用 <code>/sell 代號 張數 賣價</code> 指定賣價。`,
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Upsert pending_sell — only one active at a time per user
+  await db
+    .insert(pendingSells)
+    .values({
+      userId: profile.id,
+      symbol,
+      price: price.toString(),
+    })
+    .onConflictDoUpdate({
+      target: pendingSells.userId,
+      set: {
+        symbol,
+        price: price.toString(),
+        createdAt: new Date(),
+      },
+    });
+
+  await answerCallbackQuery({ callback_query_id: query.id });
+
+  const bare = symbol.replace(/\.(TW|TWO)$/, "");
+  const ticker = await resolveTicker(symbol).catch(() => null);
+  const nameTail = ticker?.name ? ` ${ticker.name}` : "";
+
+  const pnlPct = avgCost > 0 ? ((price - avgCost) / avgCost) * 100 : 0;
+  const sign = pnlPct >= 0 ? "+" : "";
+  const halfLots = Math.max(
+    1,
+    Math.round(sharesLotsHeld / 2)
+  );
+
+  const lines = [
+    `📊 <b>${bare}${nameTail}</b>`,
+    `持有 <b>${sharesLotsHeld % 1 === 0 ? sharesLotsHeld : sharesLotsHeld.toFixed(1)}</b> 張`,
+    `均價 ${avgCost.toFixed(2)}　現價 ${price.toFixed(2)}（${sign}${pnlPct.toFixed(2)}%）`,
+    "",
+    "選擇賣出張數，或直接回覆數字（例如：3）",
+    "",
+    `<i>5 分鐘內有效</i>`,
+  ];
+
+  await sendMessage({
+    chat_id: query.from.id,
+    text: lines.join("\n"),
+    parse_mode: "HTML",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: `全賣 ${sharesLotsHeld % 1 === 0 ? sharesLotsHeld : sharesLotsHeld.toFixed(1)} 張`,
+            callback_data: `sellq:${symbol}:all`,
+          },
+        ],
+        sharesLotsHeld > 1
+          ? [
+              {
+                text: `一半 ${halfLots} 張`,
+                callback_data: `sellq:${symbol}:half`,
+              },
+            ]
+          : [],
+        [{ text: "❌ 取消", callback_data: `sellq:${symbol}:cancel` }],
+      ].filter((row) => row.length > 0),
+    },
+  });
+}
+
+/** User tapped a qty preset (all / half) or cancel. */
+async function handleSellQtyCallback(
+  query: TelegramCallbackQuery,
+  data: string
+): Promise<void> {
+  // data = "sellq:{symbol}:{action}" — symbol may contain ".", so split from end
+  const rest = data.slice("sellq:".length);
+  const lastColon = rest.lastIndexOf(":");
+  if (lastColon < 0) {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+  const symbol = rest.slice(0, lastColon);
+  const action = rest.slice(lastColon + 1);
+
+  const [profile] = await db
+    .select({ id: userProfiles.id })
+    .from(userProfiles)
+    .where(eq(userProfiles.telegramId, query.from.id))
+    .limit(1);
+
+  if (!profile) {
+    await answerCallbackQuery({ callback_query_id: query.id, text: "找不到帳號" });
+    return;
+  }
+
+  // Always strip buttons first
+  if (query.message) {
+    await editMessageReplyMarkup({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
+  }
+
+  if (action === "cancel") {
+    await db.delete(pendingSells).where(eq(pendingSells.userId, profile.id));
+    await answerCallbackQuery({ callback_query_id: query.id, text: "已取消" });
+    await sendMessage({
+      chat_id: query.from.id,
+      text: "❌ 已取消賣出",
+      parse_mode: "HTML",
+    });
+    return;
+  }
+
+  // Fetch pending_sell (TTL check)
+  const [pending] = await db
+    .select()
+    .from(pendingSells)
+    .where(eq(pendingSells.userId, profile.id))
+    .limit(1);
+
+  if (!pending || pending.symbol !== symbol) {
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "此操作已失效，請重新 /sell",
+      show_alert: true,
+    });
+    return;
+  }
+
+  const age = Date.now() - new Date(pending.createdAt).getTime();
+  if (age > PENDING_SELL_TTL_MS) {
+    await db.delete(pendingSells).where(eq(pendingSells.userId, profile.id));
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "操作已逾時（5 分鐘），請重新 /sell",
+      show_alert: true,
+    });
+    return;
+  }
+
+  // Determine qty
+  const [holding] = await db
+    .select({ sharesLots: holdingsTable.sharesLots })
+    .from(holdingsTable)
+    .where(and(eq(holdingsTable.userId, profile.id), eq(holdingsTable.symbol, symbol)))
+    .limit(1);
+
+  if (!holding) {
+    await db.delete(pendingSells).where(eq(pendingSells.userId, profile.id));
+    await answerCallbackQuery({
+      callback_query_id: query.id,
+      text: "已無此持股",
+    });
+    return;
+  }
+
+  const heldLots = parseFloat(holding.sharesLots);
+  let qty: number;
+  if (action === "all") qty = heldLots;
+  else if (action === "half") qty = Math.max(1, Math.round(heldLots / 2));
+  else {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+
+  await answerCallbackQuery({ callback_query_id: query.id });
+
+  await executePendingSell(profile.id, query.from.id, symbol, qty, parseFloat(pending.price));
+}
+
+/**
+ * Text-message handler: if the user has an active pending_sell and sent a pure
+ * numeric message, treat it as the sell quantity. Returns true if handled.
+ */
+async function tryConsumePendingSellFromText(
+  profileId: string,
+  chatId: number,
+  text: string
+): Promise<boolean> {
+  // Only plain numbers (allow decimal for fractional lots)
+  if (!/^\d+(\.\d+)?$/.test(text.trim())) return false;
+
+  const [pending] = await db
+    .select()
+    .from(pendingSells)
+    .where(eq(pendingSells.userId, profileId))
+    .limit(1);
+
+  if (!pending) return false;
+
+  const age = Date.now() - new Date(pending.createdAt).getTime();
+  if (age > PENDING_SELL_TTL_MS) {
+    await db.delete(pendingSells).where(eq(pendingSells.userId, profileId));
+    return false;
+  }
+
+  const qty = parseFloat(text.trim());
+  if (!isFinite(qty) || qty <= 0) return false;
+
+  await executePendingSell(profileId, chatId, pending.symbol, qty, parseFloat(pending.price));
+  return true;
+}
+
+/** Shared sell executor for both button-preset and numeric-text paths. */
+async function executePendingSell(
+  profileId: string,
+  chatId: number,
+  symbol: string,
+  qty: number,
+  price: number
+): Promise<void> {
+  // Clear pending regardless of outcome to avoid double-execution
+  await db.delete(pendingSells).where(eq(pendingSells.userId, profileId));
+
+  // Look up avg cost for PnL calc
+  const [existing] = await db
+    .select({ avgCost: holdingsTable.avgCost })
+    .from(holdingsTable)
+    .where(and(eq(holdingsTable.userId, profileId), eq(holdingsTable.symbol, symbol)))
+    .limit(1);
+  const avgCost = existing ? parseFloat(existing.avgCost) : null;
+
+  try {
+    const result = await sellHolding({
+      userId: profileId,
+      symbol,
+      sharesLots: qty,
+      price,
+      note: "互動賣出",
+    });
+
+    let pnlText = "";
+    if (avgCost !== null) {
+      const realizedPnl = (price - avgCost) * qty * 1000;
+      const pnlPct = avgCost > 0 ? ((price - avgCost) / avgCost) * 100 : 0;
+      const sign = realizedPnl >= 0 ? "+" : "";
+      pnlText = `\n實現損益：${sign}NT$${Math.abs(Math.round(realizedPnl)).toLocaleString()}（${sign}${pnlPct.toFixed(1)}%）`;
+    }
+
+    const afterText = result === null
+      ? "持股已全數賣出"
+      : `剩餘 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`;
+
+    let alertRemovedNote = "";
+    if (result === null) {
+      const removed = await db
+        .delete(priceAlerts)
+        .where(and(eq(priceAlerts.userId, profileId), eq(priceAlerts.symbol, symbol)))
+        .returning({ symbol: priceAlerts.symbol });
+      if (removed.length > 0) alertRemovedNote = "\n🔕 已同步移除此股警示";
+    }
+
+    const bare = symbol.replace(/\.(TW|TWO)$/, "");
+    await sendMessage({
+      chat_id: chatId,
+      text: [
+        `✅ 已賣出 ${bare} ${qty} 張 @${price.toFixed(2)}`,
+        afterText + pnlText + alertRemovedNote,
+      ].join("\n"),
+      parse_mode: "HTML",
+    });
+  } catch (err) {
+    const m = err instanceof Error ? err.message : "";
+    const bare = symbol.replace(/\.(TW|TWO)$/, "");
+    if (m.startsWith("INSUFFICIENT:")) {
+      const current = m.split(":")[2] ?? "0";
+      await sendMessage({
+        chat_id: chatId,
+        text: `❌ 持有不足，${bare} 目前只有 ${current} 張`,
+        parse_mode: "HTML",
+      });
+    } else if (m.startsWith("NO_HOLDING:")) {
+      await sendMessage({
+        chat_id: chatId,
+        text: `❌ 你沒有持有 ${bare}`,
+        parse_mode: "HTML",
+      });
+    } else {
+      console.error("[executePendingSell] error:", err);
+      await sendMessage({
+        chat_id: chatId,
+        text: "⚠️ 賣出失敗，請稍後再試。",
+        parse_mode: "HTML",
+      });
+    }
   }
 }
 
@@ -1939,6 +2606,22 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
   // ── Alert setup: "alert:{symbol}:{preset}" where preset ∈ {3,5,7,10,skip} ─
   if (data.startsWith("alert:")) {
     await handleAlertSetupCallback(query, data);
+    return;
+  }
+
+  // ── Clear (/clear): "clear:confirm" or "clear:cancel" ────────────────────
+  if (data.startsWith("clear:")) {
+    await handleClearCallback(query, data);
+    return;
+  }
+
+  // ── Interactive sell: "sell:{symbol}" (pick) or "sellq:{symbol}:{action}" ─
+  if (data.startsWith("sell:")) {
+    await handleSellPickCallback(query, data);
+    return;
+  }
+  if (data.startsWith("sellq:")) {
+    await handleSellQtyCallback(query, data);
     return;
   }
 
