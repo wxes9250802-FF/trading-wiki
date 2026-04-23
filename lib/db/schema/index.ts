@@ -8,5 +8,6 @@ export * from "./verifications";
 export * from "./classifications";
 export * from "./holdings";
 export * from "./pending-imports";
+export * from "./pending-sells";
 export * from "./intraday-alerts";
 export * from "./price-alerts";
