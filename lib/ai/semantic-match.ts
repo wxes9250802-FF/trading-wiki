@@ -22,6 +22,7 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import { z } from "zod";
+import { toTraditional } from "@/lib/util/chinese";
 
 const MODEL = "claude-haiku-4-5";
 const CONFIDENCE_THRESHOLD = 70;
@@ -58,7 +59,9 @@ const SYSTEM_PROMPT = `你在幫一個台股情報系統做去重。下面會給
 若判定為同一件事：
 - matched = true
 - matched_tip_id = 最相似那筆候選的 id
-- merged_summary = 整合新舊雙方獨特資訊的繁體中文摘要，100 字以內，保留所有數字與細節
+- merged_summary = 整合新舊雙方獨特資訊的摘要，100 字以內，保留所有數字與細節
+  - **必須使用台灣慣用繁體中文**（例：「軟體」非「軟件」、「網路」非「網絡」、「品質」非「質量」）
+  - 禁止任何簡體字
 - confidence = 0-100（你的信心分數）
 
 若判定為不同：
@@ -169,7 +172,8 @@ export async function findSemanticMatch(
 
     return {
       matchedTipId: realId,
-      mergedSummary: parsed.merged_summary.trim(),
+      // Safety net: Haiku may still emit simplified glyphs despite the prompt.
+      mergedSummary: toTraditional(parsed.merged_summary.trim()),
       confidence: parsed.confidence,
     };
   } catch (err) {
