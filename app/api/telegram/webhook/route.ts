@@ -444,37 +444,55 @@ async function handleStats(chatId: number): Promise<void> {
   const WINDOW_DAYS = 30;
   const since = new Date(Date.now() - WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
+  // All count-based sections group by the *content hash* of the source message
+  // so duplicate text (same opinion re-forwarded across groups or days) only
+  // counts once. Media-only messages have NULL content_hash, so we fall back
+  // to the raw_message id (which is unique) — media still counts as "unique".
+  //
+  // Expressed as a Postgres expression so we can reuse it in COUNT DISTINCT:
+  //   COALESCE(raw_messages.content_hash, raw_messages.id::text)
+  const dedupKey = sql<string>`coalesce(${rawMessages.contentHash}, ${rawMessages.id}::text)`;
+
   // Run independent queries in parallel.
   const [sentimentRows, topSymbols, topIndustries, recentTips] = await Promise.all([
-    // Overall sentiment counts (last 30d)
+    // Overall sentiment counts (last 30d) — one row per unique content hash
     db
-      .select({ sentiment: tips.sentiment })
+      .select({
+        key: dedupKey,
+        sentiment: tips.sentiment,
+      })
       .from(tips)
+      .innerJoin(aiClassifications, eq(aiClassifications.tipId, tips.id))
+      .innerJoin(rawMessages, eq(aiClassifications.rawMessageId, rawMessages.id))
       .where(gte(tips.createdAt, since)),
 
-    // Top 10 mentioned symbols with sentiment breakdown
+    // Top 10 mentioned symbols with per-sentiment breakdown (dedup by hash)
     db
       .select({
         symbol: tipTickers.symbol,
-        total: sql<number>`count(*)::int`,
-        bullish: sql<number>`count(*) filter (where ${tipTickers.sentiment} = 'bullish')::int`,
-        bearish: sql<number>`count(*) filter (where ${tipTickers.sentiment} = 'bearish')::int`,
-        neutral: sql<number>`count(*) filter (where ${tipTickers.sentiment} = 'neutral')::int`,
+        total: sql<number>`count(distinct ${dedupKey})::int`,
+        bullish: sql<number>`count(distinct ${dedupKey}) filter (where ${tipTickers.sentiment} = 'bullish')::int`,
+        bearish: sql<number>`count(distinct ${dedupKey}) filter (where ${tipTickers.sentiment} = 'bearish')::int`,
+        neutral: sql<number>`count(distinct ${dedupKey}) filter (where ${tipTickers.sentiment} = 'neutral')::int`,
       })
       .from(tipTickers)
       .innerJoin(tips, eq(tipTickers.tipId, tips.id))
+      .innerJoin(aiClassifications, eq(aiClassifications.tipId, tips.id))
+      .innerJoin(rawMessages, eq(aiClassifications.rawMessageId, rawMessages.id))
       .where(gte(tips.createdAt, since))
       .groupBy(tipTickers.symbol)
-      .orderBy(desc(sql`count(*)`))
+      .orderBy(desc(sql`count(distinct ${dedupKey})`))
       .limit(10),
 
-    // Top 5 industries
+    // Top 5 industries (dedup by hash)
     db
       .select({
         industry: tips.industryCategory,
-        count: sql<number>`count(*)::int`,
+        count: sql<number>`count(distinct ${dedupKey})::int`,
       })
       .from(tips)
+      .innerJoin(aiClassifications, eq(aiClassifications.tipId, tips.id))
+      .innerJoin(rawMessages, eq(aiClassifications.rawMessageId, rawMessages.id))
       .where(
         and(
           gte(tips.createdAt, since),
@@ -483,10 +501,11 @@ async function handleStats(chatId: number): Promise<void> {
         )
       )
       .groupBy(tips.industryCategory)
-      .orderBy(desc(sql`count(*)`))
+      .orderBy(desc(sql`count(distinct ${dedupKey})`))
       .limit(5),
 
-    // Most recent 5 tips
+    // Most recent 5 tips — kept as chronological activity feed, NOT deduped
+    // (user wants to see recent submissions even if they're near-dupes)
     db
       .select({
         ticker: tips.ticker,
@@ -501,7 +520,16 @@ async function handleStats(chatId: number): Promise<void> {
       .limit(5),
   ]);
 
-  const total = sentimentRows.length;
+  // Dedup the raw sentiment rows in JS: keep one sentiment per unique hash.
+  // Same text → same AI classification → same sentiment, so first-seen wins.
+  const seenKeys = new Set<string>();
+  const uniqueSentiments: (typeof sentimentRows)[number][] = [];
+  for (const r of sentimentRows) {
+    if (seenKeys.has(r.key)) continue;
+    seenKeys.add(r.key);
+    uniqueSentiments.push(r);
+  }
+  const total = uniqueSentiments.length;
 
   if (total === 0) {
     await sendMessage({
@@ -518,9 +546,9 @@ async function handleStats(chatId: number): Promise<void> {
     return;
   }
 
-  const bullish = sentimentRows.filter((r) => r.sentiment === "bullish").length;
-  const bearish = sentimentRows.filter((r) => r.sentiment === "bearish").length;
-  const neutral = sentimentRows.filter((r) => r.sentiment === "neutral").length;
+  const bullish = uniqueSentiments.filter((r) => r.sentiment === "bullish").length;
+  const bearish = uniqueSentiments.filter((r) => r.sentiment === "bearish").length;
+  const neutral = uniqueSentiments.filter((r) => r.sentiment === "neutral").length;
 
   // Pre-fetch ticker names for top symbols (one IN query)
   const topSymbolsList = topSymbols.map((r) => r.symbol);
@@ -534,9 +562,9 @@ async function handleStats(chatId: number): Promise<void> {
   }
 
   const lines: string[] = [];
-  lines.push(`📊 <b>情報總覽</b>（近 ${WINDOW_DAYS} 天）`);
+  lines.push(`📊 <b>情報總覽</b>（近 ${WINDOW_DAYS} 天，相同內容已去重）`);
   lines.push("");
-  lines.push(`共 <b>${total}</b> 筆　📈 ${bullish}　📉 ${bearish}　➡️ ${neutral}`);
+  lines.push(`共 <b>${total}</b> 則獨立情報　📈 ${bullish}　📉 ${bearish}　➡️ ${neutral}`);
 
   // Top symbols
   if (topSymbols.length > 0) {
