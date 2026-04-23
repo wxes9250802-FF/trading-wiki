@@ -22,7 +22,7 @@ dotenv.config({ path: ".env.local" });
 
 import postgres from "postgres";
 import { drizzle } from "drizzle-orm/postgres-js";
-import { eq, and, or, inArray, lte, isNull } from "drizzle-orm";
+import { eq, and, or, inArray, lte, isNull, gte, desc } from "drizzle-orm";
 import { sql } from "drizzle-orm";
 
 // Schema imports (no Next.js env dep — only drizzle types)
@@ -34,10 +34,20 @@ import { aiClassifications } from "@/lib/db/schema/classifications";
 import { tipVerifications } from "@/lib/db/schema/verifications";
 
 import { classifyMessage, DEFAULT_MODEL, PROMPT_VERSION, type ClassifyMedia } from "@/lib/ai/classify";
+import { findSemanticMatch } from "@/lib/ai/semantic-match";
 import { fetchCurrentPrice } from "@/lib/price/client";
 import { fetchStockInfo } from "@/lib/finmind/client";
 import { sendMessage } from "@/lib/telegram/client";
 import type { RawMessage } from "@/lib/db/schema/raw-messages";
+
+// Semantic dedup window — compare against tips for the same primary ticker
+// created within this many days. Conservative (Haiku might over-merge older
+// unrelated news otherwise). Tune via env if needed.
+const SEMANTIC_MATCH_WINDOW_DAYS = Number(
+  process.env["SEMANTIC_MATCH_WINDOW_DAYS"] ?? "7"
+);
+// Hard cap on candidates sent to Haiku to keep prompt small and latency low.
+const SEMANTIC_MATCH_MAX_CANDIDATES = 10;
 
 // ─── Telegram file download ───────────────────────────────────────────────────
 
@@ -237,9 +247,92 @@ async function processMessage(msg: RawMessage): Promise<void> {
       }
     }
 
+    // ── Semantic dedup check (BEFORE opening the write transaction) ──────
+    // If the new tip is semantically a duplicate of a recent tip for the same
+    // ticker, merge into it instead of creating a new row.
+    let semanticMatch: Awaited<ReturnType<typeof findSemanticMatch>> = null;
+    if (result.is_tip && primarySymbol) {
+      const since = new Date(
+        Date.now() - SEMANTIC_MATCH_WINDOW_DAYS * 24 * 60 * 60 * 1000
+      );
+      const candidates = await db
+        .select({
+          id: tips.id,
+          summary: tips.summary,
+          createdAt: tips.createdAt,
+        })
+        .from(tips)
+        .where(and(eq(tips.ticker, primarySymbol), gte(tips.createdAt, since)))
+        .orderBy(desc(tips.createdAt))
+        .limit(SEMANTIC_MATCH_MAX_CANDIDATES);
+
+      if (candidates.length > 0) {
+        semanticMatch = await findSemanticMatch(
+          primarySymbol,
+          result.summary,
+          candidates
+        );
+        if (semanticMatch) {
+          console.log(
+            `    → semantic match: tip ${semanticMatch.matchedTipId.slice(0, 8)}… (conf=${semanticMatch.confidence})`
+          );
+        }
+      }
+    }
+
     await db.transaction(async (tx) => {
+      if (result.is_tip && semanticMatch) {
+        // ── Merge path: update existing tip's summary, don't create a new ──
+        //   one. Log a classification pointing to the matched tip so audit
+        //   still works. Point the raw_message at the matched tip too.
+        await tx
+          .update(tips)
+          .set({
+            summary: semanticMatch.mergedSummary,
+            updatedAt: new Date(),
+          })
+          .where(eq(tips.id, semanticMatch.matchedTipId));
+
+        await tx.insert(aiClassifications).values({
+          rawMessageId: msg.id,
+          tipId: semanticMatch.matchedTipId,
+          model,
+          promptVersion: PROMPT_VERSION,
+          inputTokens,
+          outputTokens,
+          rawResponse: rawResponse as object,
+          userConfirmed: null,
+        });
+
+        await tx
+          .update(rawMessages)
+          .set({
+            status: "done",
+            aiTipId: semanticMatch.matchedTipId,
+            updatedAt: new Date(),
+          })
+          .where(eq(rawMessages.id, msg.id));
+
+        console.log(
+          `    → merged into existing tip ${semanticMatch.matchedTipId.slice(0, 8)}…`
+        );
+
+        // Notify the sender that their info was merged (non-blocking, outside tx)
+        await sendMessage({
+          chat_id: msg.telegramChatId,
+          text: [
+            "📋 <b>此情報與近期情報相似，已合併更新</b>",
+            "",
+            `<b>合併後摘要：</b>${semanticMatch.mergedSummary}`,
+          ].join("\n"),
+          parse_mode: "HTML",
+        }).catch(() => {});
+
+        return;
+      }
+
       if (result.is_tip) {
-        // ── Tip: create tip row + tip_tickers + ai_classification ──────────
+        // ── New-tip path (original behaviour) ──────────────────────────────
         const primaryRaw = result.tickers[0];
 
         const [tip] = await tx
