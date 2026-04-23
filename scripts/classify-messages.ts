@@ -146,7 +146,6 @@ const SENTIMENT_LABEL: Record<string, string> = {
 
 function buildTipMessage(opts: {
   sentiment: string;
-  confidence: number;
   summary: string;
   symbols: string[];
   industryCategory?: string | null;
@@ -157,7 +156,6 @@ function buildTipMessage(opts: {
     "📊 <b>新情報分類完成</b>",
     "",
     `<b>方向：</b>${SENTIMENT_LABEL[opts.sentiment] ?? opts.sentiment}`,
-    `<b>信心：</b>${opts.confidence}/100`,
   ];
   if (opts.symbols.length > 0) {
     lines.push(`<b>股票：</b>${opts.symbols.join("、")}`);
@@ -402,7 +400,6 @@ async function processMessage(msg: RawMessage): Promise<void> {
         if (classification) {
           const text = buildTipMessage({
             sentiment: result.sentiment,
-            confidence: result.confidence,
             summary: result.summary,
             symbols: resolvedTickers.map((t) => t.symbol),
             industryCategory,
