@@ -235,7 +235,6 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
         "📋 <b>此情報 24 小時內已有人提過</b>，直接沿用分析結果：",
         "",
         `<b>方向：</b>${SENT[cached.sentiment ?? ""] ?? cached.sentiment}`,
-        cached.confidence != null ? `<b>信心：</b>${cached.confidence}/100` : "",
         cached.ticker ? `<b>主標的：</b>${cached.ticker}` : "",
         cached.industryCategory ? `<b>產業：</b>${cached.industryCategory}` : "",
         cached.sectorPosition ? `<b>地位：</b>${cached.sectorPosition}` : "",
@@ -800,9 +799,8 @@ async function handleQuery(rawCommand: string, chatId: number): Promise<void> {
       const target = r.targetPrice
         ? ` 目標 ${parseFloat(r.targetPrice).toLocaleString()}`
         : "";
-      const conf = r.confidence != null ? ` (${r.confidence}分)` : "";
       const summary = r.summary ? `\n  ${r.summary}` : "";
-      return `• ${date} ${icon}${target}${conf}${summary}`;
+      return `• ${date} ${icon}${target}${summary}`;
     });
 
     lines.push("");
