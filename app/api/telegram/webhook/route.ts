@@ -38,6 +38,7 @@ import { priceAlerts } from "@/lib/db/schema/price-alerts";
 import { tickers } from "@/lib/db/schema/tickers";
 import { pendingSells } from "@/lib/db/schema/pending-sells";
 import { fetchCurrentPrice } from "@/lib/price/client";
+import { formatSymbolName, stripTwSuffix } from "@/lib/util/symbol";
 
 const MAX_TEXT_CHARS = 2000;
 const DEDUP_WINDOW_MS = 24 * 60 * 60 * 1000; // 24 hours
@@ -560,6 +561,19 @@ async function handleStats(chatId: number): Promise<void> {
     for (const r of nameRows) tickerNameMap.set(r.symbol, r.name);
   }
 
+  // Extend the ticker name map with any tickers from the 最新情報 section so
+  // those lines can also show "CODE NAME"
+  const recentTickers = recentTips
+    .map((t) => t.ticker)
+    .filter((s): s is string => !!s && !tickerNameMap.has(s));
+  if (recentTickers.length > 0) {
+    const recentNameRows = await db
+      .select({ symbol: tickers.symbol, name: tickers.name })
+      .from(tickers)
+      .where(inArray(tickers.symbol, recentTickers));
+    for (const r of recentNameRows) tickerNameMap.set(r.symbol, r.name);
+  }
+
   const lines: string[] = [];
   lines.push(`📊 <b>情報總覽</b>（近 ${WINDOW_DAYS} 天，相同內容已去重）`);
   lines.push("");
@@ -570,15 +584,13 @@ async function handleStats(chatId: number): Promise<void> {
     lines.push("");
     lines.push(`🔥 <b>熱門個股 Top ${topSymbols.length}</b>`);
     topSymbols.forEach((row, idx) => {
-      const bare = row.symbol.replace(/\.(TW|TWO)$/, "");
-      const name = tickerNameMap.get(row.symbol) ?? "";
-      const tag = name ? ` ${name}` : "";
+      const label = formatSymbolName(row.symbol, tickerNameMap.get(row.symbol));
       const sentimentParts: string[] = [];
       if (row.bullish > 0) sentimentParts.push(`📈${row.bullish}`);
       if (row.bearish > 0) sentimentParts.push(`📉${row.bearish}`);
       if (row.neutral > 0) sentimentParts.push(`➡️${row.neutral}`);
       const sentTail = sentimentParts.length > 0 ? ` ｜ ${sentimentParts.join(" ")}` : "";
-      lines.push(`${idx + 1}. <b>${bare}</b>${tag}　${row.total} 次${sentTail}`);
+      lines.push(`${idx + 1}. <b>${label}</b>　${row.total} 次${sentTail}`);
     });
   }
 
@@ -602,7 +614,9 @@ async function handleStats(chatId: number): Promise<void> {
         month: "2-digit",
         day: "2-digit",
       });
-      const tkr = t.ticker ? ` <b>${t.ticker.replace(/\.(TW|TWO)$/, "")}</b>` : "";
+      const tkr = t.ticker
+        ? ` <b>${formatSymbolName(t.ticker, tickerNameMap.get(t.ticker))}</b>`
+        : "";
       const tgt = t.targetPrice
         ? ` 目標 ${parseFloat(t.targetPrice).toLocaleString()}`
         : "";
@@ -1095,12 +1109,12 @@ async function handlePortfolio(userId: string, chatId: number): Promise<void> {
     let allHavePrice = true;
 
     rows.forEach((row, idx) => {
-      const shortSymbol = row.symbol.replace(/\.(TW|TWO)$/, "");
+      const label = formatSymbolName(row.symbol, row.name);
       const lotsStr = row.sharesLots % 1 === 0
         ? String(row.sharesLots)
         : row.sharesLots.toFixed(1);
 
-      lines.push(`${idx + 1}. <b>${shortSymbol}</b> ${lotsStr} 張 @${row.avgCost.toFixed(2)}`);
+      lines.push(`${idx + 1}. <b>${label}</b> ${lotsStr} 張 @${row.avgCost.toFixed(2)}`);
 
       if (row.currentPrice !== null && row.marketValue !== null && row.pnl !== null && row.pnlPct !== null) {
         const sign = row.pnl >= 0 ? "+" : "";
@@ -1176,9 +1190,9 @@ async function handleClearPrompt(userId: string, chatId: number): Promise<void> 
   let totalCost = 0;
   for (let i = 0; i < rows.length; i++) {
     const r = rows[i]!;
-    const bare = r.symbol.replace(/\.(TW|TWO)$/, "");
+    const label = formatSymbolName(r.symbol, r.name);
     const lotsStr = r.sharesLots % 1 === 0 ? String(r.sharesLots) : r.sharesLots.toFixed(1);
-    lines.push(`${i + 1}. ${bare} ${lotsStr} 張 @均價 ${r.avgCost.toFixed(2)}`);
+    lines.push(`${i + 1}. ${label} ${lotsStr} 張 @均價 ${r.avgCost.toFixed(2)}`);
     totalCost += r.costBasis;
   }
 
@@ -1287,8 +1301,8 @@ async function handleClearCallback(
   });
 
   type LiquidationResult =
-    | { ok: true; symbol: string; lots: number; price: number; pnl: number }
-    | { ok: false; symbol: string; reason: string };
+    | { ok: true; symbol: string; name: string | null; lots: number; price: number; pnl: number }
+    | { ok: false; symbol: string; name: string | null; reason: string };
 
   const results: LiquidationResult[] = [];
 
@@ -1296,7 +1310,7 @@ async function handleClearCallback(
     // Prefer the price listPortfolio already fetched; fall back to a live lookup
     const price = r.currentPrice ?? (await fetchCurrentPrice(r.symbol));
     if (!price) {
-      results.push({ ok: false, symbol: r.symbol, reason: "取不到市價" });
+      results.push({ ok: false, symbol: r.symbol, name: r.name, reason: "取不到市價" });
       continue;
     }
     try {
@@ -1320,6 +1334,7 @@ async function handleClearCallback(
       results.push({
         ok: true,
         symbol: r.symbol,
+        name: r.name,
         lots: r.sharesLots,
         price,
         pnl,
@@ -1329,6 +1344,7 @@ async function handleClearCallback(
       results.push({
         ok: false,
         symbol: r.symbol,
+        name: r.name,
         reason: err instanceof Error ? err.message : "未知錯誤",
       });
     }
@@ -1346,11 +1362,11 @@ async function handleClearCallback(
 
   if (succeeded.length > 0) {
     for (const s of succeeded) {
-      const bare = s.symbol.replace(/\.(TW|TWO)$/, "");
+      const label = formatSymbolName(s.symbol, s.name);
       const lotsStr = s.lots % 1 === 0 ? String(s.lots) : s.lots.toFixed(1);
       const pSign = s.pnl >= 0 ? "+" : "";
       lines.push(
-        `• ${bare} ${lotsStr} 張 @${s.price.toFixed(2)}　${pSign}NT$${Math.abs(Math.round(s.pnl)).toLocaleString()}`
+        `• ${label} ${lotsStr} 張 @${s.price.toFixed(2)}　${pSign}NT$${Math.abs(Math.round(s.pnl)).toLocaleString()}`
       );
     }
     lines.push("");
@@ -1363,8 +1379,8 @@ async function handleClearCallback(
     lines.push("");
     lines.push("⚠️ <b>未賣出：</b>");
     for (const f of failed) {
-      const bare = f.symbol.replace(/\.(TW|TWO)$/, "");
-      lines.push(`• ${bare} — ${f.reason}`);
+      const label = formatSymbolName(f.symbol, f.name);
+      lines.push(`• ${label} — ${f.reason}`);
     }
     lines.push("");
     lines.push("請用 <code>/sell 代號 張數 賣價</code> 手動處理上述標的。");
@@ -1398,14 +1414,14 @@ async function handleSellInteractiveList(
   }
 
   const keyboard: { text: string; callback_data: string }[][] = rows.map((r) => {
-    const bare = r.symbol.replace(/\.(TW|TWO)$/, "");
+    const label = formatSymbolName(r.symbol, r.name);
     const lotsStr = r.sharesLots % 1 === 0 ? String(r.sharesLots) : r.sharesLots.toFixed(1);
     const priceTail = r.currentPrice !== null
       ? ` 現價 ${r.currentPrice.toFixed(2)}`
       : "";
     return [
       {
-        text: `${bare} ${lotsStr}張${priceTail}`,
+        text: `${label} ${lotsStr}張${priceTail}`,
         // callback_data must be ≤64 bytes; symbols are short so this is fine
         callback_data: `sell:${r.symbol}`,
       },
@@ -1496,7 +1512,7 @@ async function handleSellPickCallback(
     });
     await sendMessage({
       chat_id: query.from.id,
-      text: `⚠️ 取不到 ${symbol.replace(/\.(TW|TWO)$/, "")} 的市價，請改用 <code>/sell 代號 張數 賣價</code> 指定賣價。`,
+      text: `⚠️ 取不到 ${stripTwSuffix(symbol)} 的市價，請改用 <code>/sell 代號 張數 賣價</code> 指定賣價。`,
       parse_mode: "HTML",
     });
     return;
@@ -1521,9 +1537,8 @@ async function handleSellPickCallback(
 
   await answerCallbackQuery({ callback_query_id: query.id });
 
-  const bare = symbol.replace(/\.(TW|TWO)$/, "");
   const ticker = await resolveTicker(symbol).catch(() => null);
-  const nameTail = ticker?.name ? ` ${ticker.name}` : "";
+  const label = formatSymbolName(symbol, ticker?.name);
 
   const pnlPct = avgCost > 0 ? ((price - avgCost) / avgCost) * 100 : 0;
   const sign = pnlPct >= 0 ? "+" : "";
@@ -1533,7 +1548,7 @@ async function handleSellPickCallback(
   );
 
   const lines = [
-    `📊 <b>${bare}${nameTail}</b>`,
+    `📊 <b>${label}</b>`,
     `持有 <b>${sharesLotsHeld % 1 === 0 ? sharesLotsHeld : sharesLotsHeld.toFixed(1)}</b> 張`,
     `均價 ${avgCost.toFixed(2)}　現價 ${price.toFixed(2)}（${sign}${pnlPct.toFixed(2)}%）`,
     "",
@@ -1715,13 +1730,15 @@ async function executePendingSell(
   // Clear pending regardless of outcome to avoid double-execution
   await db.delete(pendingSells).where(eq(pendingSells.userId, profileId));
 
-  // Look up avg cost for PnL calc
+  // Look up avg cost for PnL calc + ticker name for display
   const [existing] = await db
     .select({ avgCost: holdingsTable.avgCost })
     .from(holdingsTable)
     .where(and(eq(holdingsTable.userId, profileId), eq(holdingsTable.symbol, symbol)))
     .limit(1);
   const avgCost = existing ? parseFloat(existing.avgCost) : null;
+  const ticker = await resolveTicker(symbol).catch(() => null);
+  const label = formatSymbolName(symbol, ticker?.name);
 
   try {
     const result = await sellHolding({
@@ -1753,29 +1770,27 @@ async function executePendingSell(
       if (removed.length > 0) alertRemovedNote = "\n🔕 已同步移除此股警示";
     }
 
-    const bare = symbol.replace(/\.(TW|TWO)$/, "");
     await sendMessage({
       chat_id: chatId,
       text: [
-        `✅ 已賣出 ${bare} ${qty} 張 @${price.toFixed(2)}`,
+        `✅ 已賣出 ${label} ${qty} 張 @${price.toFixed(2)}`,
         afterText + pnlText + alertRemovedNote,
       ].join("\n"),
       parse_mode: "HTML",
     });
   } catch (err) {
     const m = err instanceof Error ? err.message : "";
-    const bare = symbol.replace(/\.(TW|TWO)$/, "");
     if (m.startsWith("INSUFFICIENT:")) {
       const current = m.split(":")[2] ?? "0";
       await sendMessage({
         chat_id: chatId,
-        text: `❌ 持有不足，${bare} 目前只有 ${current} 張`,
+        text: `❌ 持有不足，${label} 目前只有 ${current} 張`,
         parse_mode: "HTML",
       });
     } else if (m.startsWith("NO_HOLDING:")) {
       await sendMessage({
         chat_id: chatId,
-        text: `❌ 你沒有持有 ${bare}`,
+        text: `❌ 你沒有持有 ${label}`,
         parse_mode: "HTML",
       });
     } else {
@@ -1847,6 +1862,7 @@ function parseAlertTokens(tokens: string[]): {
 
 function formatAlertLine(row: {
   symbol: string;
+  name?: string | null;
   upPct: string | null;
   downPct: string | null;
   volumeMultiplier: string | null;
@@ -1855,7 +1871,7 @@ function formatAlertLine(row: {
   if (row.upPct !== null) parts.push(`漲 ≥ ${parseFloat(row.upPct).toFixed(1)}%`);
   if (row.downPct !== null) parts.push(`跌 ≤ ${parseFloat(row.downPct).toFixed(1)}%`);
   if (row.volumeMultiplier !== null) parts.push(`量 × ${parseFloat(row.volumeMultiplier).toFixed(1)}`);
-  return `${row.symbol} ｜ ${parts.join("  ")}`;
+  return `${formatSymbolName(row.symbol, row.name)} ｜ ${parts.join("  ")}`;
 }
 
 async function handleAlertSet(
@@ -1963,7 +1979,7 @@ async function handleAlertSet(
     text: [
       `🔔 <b>已設定警示</b>`,
       "",
-      `<b>標的：</b>${ticker.symbol}`,
+      `<b>標的：</b>${formatSymbolName(ticker.symbol, ticker.name)}`,
       `<b>條件：</b>${confirmParts.join("  ／  ")}`,
       "",
       `盤中 09:30-13:30 每小時自動檢查，觸發時通知你。`,
@@ -1976,12 +1992,14 @@ async function handleAlertList(userId: string, chatId: number): Promise<void> {
   const rows = await db
     .select({
       symbol: priceAlerts.symbol,
+      name: tickers.name,
       upPct: priceAlerts.upPct,
       downPct: priceAlerts.downPct,
       volumeMultiplier: priceAlerts.volumeMultiplier,
       enabled: priceAlerts.enabled,
     })
     .from(priceAlerts)
+    .leftJoin(tickers, eq(tickers.symbol, priceAlerts.symbol))
     .where(eq(priceAlerts.userId, userId))
     .orderBy(priceAlerts.symbol);
 
@@ -2056,18 +2074,20 @@ async function handleAlertRemove(
     )
     .returning({ symbol: priceAlerts.symbol });
 
+  const bareTarget = stripTwSuffix(targetSymbol);
   if (deleted.length === 0) {
     await sendMessage({
       chat_id: chatId,
-      text: `ℹ️ 找不到 <code>${targetSymbol}</code> 的警示設定（可能已被移除或從未設定）。`,
+      text: `ℹ️ 找不到 <code>${bareTarget}</code> 的警示設定（可能已被移除或從未設定）。`,
       parse_mode: "HTML",
     });
     return;
   }
 
+  const removedLabel = formatSymbolName(targetSymbol, ticker?.name);
   await sendMessage({
     chat_id: chatId,
-    text: `✅ 已移除 <code>${targetSymbol}</code> 的盤中警示。`,
+    text: `✅ 已移除 <code>${removedLabel}</code> 的盤中警示。`,
     parse_mode: "HTML",
   });
 }
@@ -2086,7 +2106,7 @@ async function sendAlertSetupPrompt(
   symbol: string,
   displayName?: string
 ): Promise<void> {
-  const label = displayName ? `${symbol} ${displayName}` : symbol;
+  const label = formatSymbolName(symbol, displayName);
   await sendMessage({
     chat_id: chatId,
     text: [
@@ -2166,9 +2186,10 @@ async function handleAlertSetupCallback(
       callback_query_id: query.id,
       text: "已略過警示設定",
     });
+    const bareSkip = stripTwSuffix(symbol);
     await sendMessage({
       chat_id: query.from.id,
-      text: `⏭ <b>${symbol}</b> 未設定警示。日後可用 <code>/alert ${symbol} +漲% -跌%</code> 自訂。`,
+      text: `⏭ <b>${bareSkip}</b> 未設定警示。日後可用 <code>/alert ${bareSkip} +漲% -跌%</code> 自訂。`,
       parse_mode: "HTML",
     });
     return;
@@ -2204,19 +2225,23 @@ async function handleAlertSetupCallback(
       },
     });
 
+  const tickerRow = await resolveTicker(symbol).catch(() => null);
+  const setLabel = formatSymbolName(symbol, tickerRow?.name);
+  const bareSet = stripTwSuffix(symbol);
+
   await answerCallbackQuery({
     callback_query_id: query.id,
-    text: `✅ 已設定 ${symbol} ±${pct}% 警示`,
+    text: `✅ 已設定 ${bareSet} ±${pct}% 警示`,
   });
 
   await sendMessage({
     chat_id: query.from.id,
     text: [
-      `🔔 <b>${symbol} 警示已設定</b>`,
+      `🔔 <b>${setLabel} 警示已設定</b>`,
       `漲 ≥ ${upPct}% 或跌 ≤ ${downPct}% 會通知你`,
       "",
-      `想改門檻：<code>/alert ${symbol} +X -Y</code>`,
-      `關閉：<code>/unalert ${symbol}</code>`,
+      `想改門檻：<code>/alert ${bareSet} +X -Y</code>`,
+      `關閉：<code>/unalert ${bareSet}</code>`,
     ].join("\n"),
     parse_mode: "HTML",
   });

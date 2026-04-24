@@ -2,6 +2,7 @@ import "server-only";
 import { eq, and } from "drizzle-orm";
 import { db } from "@/lib/db/client";
 import { holdings, holdingTransactions } from "@/lib/db/schema/holdings";
+import { tickers } from "@/lib/db/schema/tickers";
 import { fetchCurrentPrice } from "@/lib/price/client";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -13,6 +14,8 @@ export interface HoldingResult {
 }
 
 export interface PortfolioRow extends HoldingResult {
+  /** Display name from tickers table; null for warrants or un-synced symbols */
+  name: string | null;
   currentPrice: number | null;
   marketValue: number | null;  // sharesLots * 1000 * currentPrice
   costBasis: number;           // sharesLots * 1000 * avgCost
@@ -181,9 +184,17 @@ export async function sellHolding(opts: {
  * 1 張 = 1000 股，marketValue / costBasis 以股為單位計算。
  */
 export async function listPortfolio(userId: string): Promise<PortfolioRow[]> {
+  // LEFT JOIN tickers so warrants / un-synced symbols still come through
+  // (with null name) instead of being filtered out.
   const rows = await db
-    .select()
+    .select({
+      symbol: holdings.symbol,
+      sharesLots: holdings.sharesLots,
+      avgCost: holdings.avgCost,
+      name: tickers.name,
+    })
     .from(holdings)
+    .leftJoin(tickers, eq(tickers.symbol, holdings.symbol))
     .where(eq(holdings.userId, userId));
 
   // 並行抓所有市價
@@ -207,6 +218,7 @@ export async function listPortfolio(userId: string): Promise<PortfolioRow[]> {
 
       return {
         symbol: row.symbol,
+        name: row.name,
         sharesLots,
         avgCost,
         currentPrice,
