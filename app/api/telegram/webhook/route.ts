@@ -307,40 +307,43 @@ async function handleCommand(
 
   try {
     if (command === "/start" || command === "/help") {
+      const lines = [
+        "🤖 <b>Trading Intelligence Hub</b>",
+        "",
+        "可用指令：",
+        "/q 股票代號 — 查詢某支股票的所有情報",
+        "/stats — 查看情報總覽統計",
+        "/help — 顯示此說明",
+        "",
+        "📦 <b>持股管理：</b>",
+        "/buy 代號 張數 成本 — 買入，例如 <code>/buy 2330 10 985.5</code>",
+        "/sell — 互動選單（選持股 → 選張數，用 FinMind 現價）",
+        "/sell 代號 張數 賣價 — 指定價賣出，例如 <code>/sell 2330 5 1050</code>",
+        "/clear — 一鍵清倉（全數以現價賣出）",
+        "/portfolio — 查看我的持股與損益",
+        "/import — 批次匯入持股：",
+        "  • 文字：<code>/import</code> 後每行寫 <code>代號 張數 成本</code>",
+        "  • 截圖：上傳圖片、caption 寫 /import",
+        "  （僅追蹤股票與 ETF；權證會自動略過）",
+        "",
+        "🔔 <b>盤中警示：</b>",
+        "/alert 代號 +漲% -跌% vol 量倍數 — 設定警示條件",
+        "  例如 <code>/alert 2330 +3 -5</code>（漲 3% 或跌 5% 通知）",
+        "  或 <code>/alert 2330 -5 vol 2</code>（跌 5% 或量 2 倍通知）",
+        "/alerts — 列出所有已設定的警示",
+        "/unalert 代號 — 移除某檔警示",
+      ];
+      if (profile.role === "admin") {
+        lines.push("", "（管理員限定）", "/invite — 產生新邀請碼");
+      }
+      lines.push(
+        "",
+        "範例：",
+        "<code>/q 2330</code>　<code>/alert 2330 +5 -3</code>"
+      );
       await sendMessage({
         chat_id: chatId,
-        text: [
-          "🤖 <b>Trading Intelligence Hub</b>",
-          "",
-          "可用指令：",
-          "/q 股票代號 — 查詢某支股票的所有情報",
-          "/stats — 查看情報總覽統計",
-          "/help — 顯示此說明",
-          "",
-          "📦 <b>持股管理：</b>",
-          "/buy 代號 張數 成本 — 買入，例如 <code>/buy 2330 10 985.5</code>",
-          "/sell — 互動選單（選持股 → 選張數，用 FinMind 現價）",
-          "/sell 代號 張數 賣價 — 指定價賣出，例如 <code>/sell 2330 5 1050</code>",
-          "/clear — 一鍵清倉（全數以現價賣出）",
-          "/portfolio — 查看我的持股與損益",
-          "/import — 批次匯入持股：",
-          "  • 文字：<code>/import</code> 後每行寫 <code>代號 張數 成本</code>",
-          "  • 截圖：上傳圖片、caption 寫 /import",
-          "  （僅追蹤股票與 ETF；權證會自動略過）",
-          "",
-          "🔔 <b>盤中警示：</b>",
-          "/alert 代號 +漲% -跌% vol 量倍數 — 設定警示條件",
-          "  例如 <code>/alert 2330 +3 -5</code>（漲 3% 或跌 5% 通知）",
-          "  或 <code>/alert 2330 -5 vol 2</code>（跌 5% 或量 2 倍通知）",
-          "/alerts — 列出所有已設定的警示",
-          "/unalert 代號 — 移除某檔警示",
-          "",
-          "（管理員限定）",
-          "/invite — 產生新邀請碼",
-          "",
-          "範例：",
-          "<code>/q 2330</code>　<code>/alert 2330 +5 -3</code>",
-        ].join("\n"),
+        text: lines.join("\n"),
         parse_mode: "HTML",
       });
       return;
