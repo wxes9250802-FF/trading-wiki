@@ -2,14 +2,14 @@
 /**
  * Register the bot's slash-command menu via Telegram setMyCommands API.
  *
- * After running this, typing "/" in a chat with the bot surfaces an
- * autocomplete list with a one-line Chinese description per command.
+ * Two scopes:
+ *   - default        : commands every user sees in the / menu
+ *   - chat(admin_id) : commands admins see (adds /invite)
+ *
+ * Admin telegram IDs come from ADMIN_TELEGRAM_IDS env (comma-separated).
  *
  * Run whenever the command list changes:
  *   bun run telegram:register-commands
- *
- * Required env vars:
- *   TELEGRAM_BOT_TOKEN — from @BotFather
  */
 
 import * as dotenv from "dotenv";
@@ -21,10 +21,21 @@ if (!BOT_TOKEN) {
   process.exit(1);
 }
 
-// Each command is limited to:
-//   command:     1-32 chars, [a-z0-9_]
-//   description: 1-256 chars
-const COMMANDS: { command: string; description: string }[] = [
+const ADMIN_IDS = (process.env["ADMIN_TELEGRAM_IDS"] ?? "")
+  .split(",")
+  .map((s) => parseInt(s.trim(), 10))
+  .filter((n) => Number.isFinite(n) && n > 0);
+
+if (ADMIN_IDS.length === 0) {
+  console.warn("⚠ ADMIN_TELEGRAM_IDS not set — /invite won't appear in any menu.");
+  console.warn("  Add ADMIN_TELEGRAM_IDS=<your_telegram_numeric_id> to .env.local");
+}
+
+// ─── Command definitions ──────────────────────────────────────────────────────
+
+type Cmd = { command: string; description: string };
+
+const MEMBER_COMMANDS: Cmd[] = [
   { command: "q", description: "查股票：即時價、三大法人、情報" },
   { command: "stats", description: "近 30 天情報總覽與熱門個股" },
   { command: "portfolio", description: "查看我的持股與損益" },
@@ -35,65 +46,93 @@ const COMMANDS: { command: string; description: string }[] = [
   { command: "alert", description: "設定盤中警示：/alert 代號 +N -N" },
   { command: "alerts", description: "列出已設定的警示" },
   { command: "unalert", description: "移除某檔警示：/unalert 代號" },
-  { command: "invite", description: "產生邀請連結（管理員）" },
   { command: "help", description: "顯示完整指令說明" },
 ];
 
-// Validate locally to catch typos before hitting the API
-for (const c of COMMANDS) {
+const ADMIN_COMMANDS: Cmd[] = [
+  ...MEMBER_COMMANDS,
+  { command: "invite", description: "產生新邀請連結（管理員）" },
+];
+
+for (const c of ADMIN_COMMANDS) {
   if (!/^[a-z0-9_]{1,32}$/.test(c.command)) {
-    console.error(`Invalid command name: "${c.command}"`);
-    process.exit(1);
-  }
-  if (c.description.length < 1 || c.description.length > 256) {
-    console.error(`Invalid description length for "${c.command}"`);
+    console.error(`Invalid command name: ${c.command}`);
     process.exit(1);
   }
 }
 
-console.log(`Registering ${COMMANDS.length} commands:`);
-for (const c of COMMANDS) console.log(`  /${c.command.padEnd(12)} ${c.description}`);
+// ─── API ──────────────────────────────────────────────────────────────────────
 
-const res = await fetch(
-  `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`,
-  {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      commands: COMMANDS,
-      // scope default = "default" (applies to private + group chats for every user)
-      language_code: "zh",
-    }),
+async function setCommands(
+  commands: Cmd[],
+  scope?: { type: string; chat_id?: number }
+): Promise<void> {
+  const body: Record<string, unknown> = { commands };
+  if (scope) body["scope"] = scope;
+
+  const res = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }
+  );
+  const data = (await res.json()) as {
+    ok: boolean;
+    description?: string;
+    error_code?: number;
+  };
+  if (!data.ok) {
+    throw new Error(
+      `setMyCommands failed (${data.error_code}): ${data.description}`
+    );
   }
-);
+}
 
-const data = (await res.json()) as {
-  ok: boolean;
-  description?: string;
-  error_code?: number;
-};
+/** Delete any commands scoped to a language — avoids stale zh-locale set
+ *  from earlier versions of this script overriding our new default. */
+async function deleteLanguageScopedCommands(language: string): Promise<void> {
+  const res = await fetch(
+    `https://api.telegram.org/bot${BOT_TOKEN}/deleteMyCommands`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ language_code: language }),
+    }
+  );
+  const data = (await res.json()) as { ok: boolean };
+  if (!data.ok) {
+    console.warn(`⚠ deleteMyCommands language=${language} failed (non-fatal)`);
+  }
+}
 
-if (!data.ok) {
-  console.error(`\n✗ setMyCommands failed (${data.error_code}): ${data.description}`);
+// ─── Main ─────────────────────────────────────────────────────────────────────
+
+async function main() {
+  // Clean up any zh-locale commands set by older versions — without this,
+  // Telegram's scope precedence picks the zh one over our new default for
+  // zh users and the per-admin chat scope never kicks in.
+  await deleteLanguageScopedCommands("zh");
+  console.log("✓ cleared zh-locale commands");
+
+  // Default scope — everyone sees these
+  await setCommands(MEMBER_COMMANDS);
+  console.log(`✓ default commands registered (${MEMBER_COMMANDS.length} entries)`);
+
+  // Per-admin chat scope — adds /invite
+  for (const id of ADMIN_IDS) {
+    await setCommands(ADMIN_COMMANDS, { type: "chat", chat_id: id });
+    console.log(`✓ admin commands registered for chat ${id} (${ADMIN_COMMANDS.length} entries)`);
+  }
+
+  console.log("\n在 Telegram 輸入 / 確認：");
+  console.log("  • 你（admin）：看到 /invite");
+  console.log("  • 其他成員：不會看到 /invite");
+  console.log("（Telegram 端可能有 1-2 分鐘快取，換 chat 可加速）");
+}
+
+main().catch((err) => {
+  console.error("✗", err);
   process.exit(1);
-}
-
-console.log("\n✓ zh commands registered");
-
-// Also set the default (language-agnostic) list as a fallback
-const fallbackRes = await fetch(
-  `https://api.telegram.org/bot${BOT_TOKEN}/setMyCommands`,
-  {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ commands: COMMANDS }),
-  }
-);
-const fallbackData = (await fallbackRes.json()) as { ok: boolean; description?: string };
-if (!fallbackData.ok) {
-  console.warn(`⚠ default-scope update failed: ${fallbackData.description}`);
-} else {
-  console.log("✓ default commands registered");
-}
-
-console.log("\n在 Telegram 輸入 / 就會看到指令清單（可能要等 1–2 分鐘、或重開聊天室）。");
+});
