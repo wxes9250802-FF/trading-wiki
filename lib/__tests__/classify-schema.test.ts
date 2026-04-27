@@ -115,8 +115,14 @@ describe("classifySchema — tip (is_tip: true)", () => {
 
   // ── Validation failures ──────────────────────────────────────────────────
 
-  it("rejects any non-TW market value (US/CRYPTO/JP etc.)", () => {
-    for (const market of ["US", "CRYPTO", "JP"]) {
+  it("accepts both TW and US markets", () => {
+    for (const market of ["TW", "US"]) {
+      expect(classifySchema.safeParse({ ...VALID_TIP, market }).success).toBe(true);
+    }
+  });
+
+  it("rejects unsupported markets (CRYPTO/JP/etc.)", () => {
+    for (const market of ["CRYPTO", "JP", "HK"]) {
       expect(classifySchema.safeParse({ ...VALID_TIP, market }).success).toBe(false);
     }
   });
