@@ -17,7 +17,7 @@ export interface ParseHoldingsResult {
 
 // ─── Claude Vision prompt ──────────────────────────────────────────────────────
 
-const SYSTEM_PROMPT = `你是台股持股解析助手。這張截圖是台股券商 APP 的持股明細畫面。
+const SYSTEM_PROMPT_TW = `你是台股持股解析助手。這張截圖是台股券商 APP 的持股明細畫面。
 
 請解析每一筆持股，分成兩類回傳 JSON 物件：
 
@@ -54,6 +54,33 @@ const SYSTEM_PROMPT = `你是台股持股解析助手。這張截圖是台股券
 
 只回傳 JSON 物件，不加其他文字、不加 markdown 標記。`;
 
+const SYSTEM_PROMPT_US = `你是美股持股解析助手。這張截圖是美股券商 APP（如 Schwab、Fidelity、Robinhood、IBKR、Firstrade、TD Ameritrade、複委託 等）的持股明細畫面。
+
+請解析每一筆持股，回傳 JSON 物件：
+
+{
+  "items": [
+    { "symbol": "AAPL", "sharesLots": 5, "avgCost": 178.5 },
+    ...
+  ],
+  "skippedWarrants": []
+}
+
+規則：
+- items: 美股股票或 ETF，symbol 為 1-5 位英文大寫字母（例 "AAPL"、"MSFT"、"NVDA"、"SPY"、"QQQ"），可含一個 . 或 - 表示子類股（例 "BRK.B"、"BF.B"）
+- sharesLots: 持有股數（美股以「股」為單位，不是張）
+- avgCost: 每股成本價（美元 USD）
+- skippedWarrants: 對美股不適用，永遠是空陣列 []
+- 看不清楚、欄位不全的整筆跳過
+- 如果整張圖看不出任何美股，回傳 {"items": [], "skippedWarrants": []}
+
+**完全忽略的項目：**
+- 期貨、選擇權（Options，例 "AAPL 250118C00200000"）
+- 加密貨幣（BTC、ETH 等）
+- 債券、基金、認購權（Warrants，例 "BRK-WS"）
+
+只回傳 JSON 物件，不加其他文字、不加 markdown 標記。`;
+
 // ─── Client ───────────────────────────────────────────────────────────────────
 
 let _client: Anthropic | undefined;
@@ -70,21 +97,23 @@ function getClient(): Anthropic {
 // ─── Main function ─────────────────────────────────────────────────────────────
 
 /**
- * 傳入 base64 JPEG 圖片，呼叫 Claude Vision 解析台股持股截圖。
- * 回傳 items（股票/ETF）與 skippedWarrants（被識別但不匯入的權證代碼）；
- * 若 Vision 失敗或 JSON 無法解析，回傳 null。
+ * 傳入 base64 JPEG 圖片，呼叫 Claude Vision 解析持股截圖。
+ * 市場參數決定使用哪一份 prompt（TW vs US）。
+ * 回傳 items 與 skippedWarrants；若 Vision 失敗或 JSON 無法解析，回傳 null。
  */
 export async function parseHoldingsPhoto(
-  base64: string
+  base64: string,
+  market: "TW" | "US" = "TW"
 ): Promise<ParseHoldingsResult | null> {
   const client = getClient();
+  const systemPrompt = market === "US" ? SYSTEM_PROMPT_US : SYSTEM_PROMPT_TW;
 
   let response: Anthropic.Message;
   try {
     response = await client.messages.create({
       model: "claude-haiku-4-5",
       max_tokens: 1024,
-      system: SYSTEM_PROMPT,
+      system: systemPrompt,
       messages: [
         {
           role: "user",
@@ -146,16 +175,20 @@ export async function parseHoldingsPhoto(
     return null;
   }
 
-  // Validate items. Accept:
-  //   - 4-5 digit pure numeric (一般股 + ETF)
-  //   - 6 digit pure numeric STARTING WITH 00 (ETF like 006208)
-  // Anything 6-char with a letter, or 6 digits not starting with 00, is
-  // redirected to skippedWarrants (second-line defence if Claude misclassifies).
+  // Validate items. Accept formats based on market:
+  //   TW: 4-5 digit numeric, or 6 digit starting with 00 (ETF like 006208)
+  //   US: 1-5 uppercase letters, optionally with .X or -X suffix
+  // Anything 6-char numeric not starting with 00 (TW only), or other malformed
+  // strings, is redirected to skippedWarrants (second-line defence).
   const items: ParsedHoldingItem[] = [];
   const skippedWarrants = new Set<string>();
 
-  const isStockOrEtf = (s: string): boolean =>
-    /^\d{4,5}$/.test(s) || /^00\d{4}$/.test(s);
+  const isStockOrEtf = (s: string): boolean => {
+    if (market === "US") {
+      return /^[A-Z]{1,5}(?:[.-][A-Z]{1,2})?$/.test(s);
+    }
+    return /^\d{4,5}$/.test(s) || /^00\d{4}$/.test(s);
+  };
 
   for (const item of rawItems) {
     if (

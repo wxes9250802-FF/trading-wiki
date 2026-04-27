@@ -31,8 +31,22 @@ import type { TelegramUpdate, TelegramCallbackQuery, TelegramMessage } from "@/l
 import { buyHolding, sellHolding, listPortfolio } from "@/lib/holdings/manager";
 import { parseHoldingsPhoto, type ParsedHoldingItem } from "@/lib/holdings/import-from-photo";
 import { resolveTicker } from "@/lib/ticker/resolver";
-import { classifyTwSymbol } from "@/lib/ticker/classify";
-import { fetchLatestQuote, fetchInstitutionalInvestors } from "@/lib/finmind/client";
+import { classifyTwSymbol, classifyMarket } from "@/lib/ticker/classify";
+import { fetchInstitutionalInvestors } from "@/lib/finmind/client";
+import { fetchLatestQuote } from "@/lib/price/client";
+import {
+  fetchUsCompanyProfile,
+  fetchUsInsiderTransactions,
+  fetchUsRecommendations,
+} from "@/lib/finnhub/client";
+import { upsertUsTicker } from "@/lib/ticker/upsert-us";
+import {
+  marketFromSymbol,
+  sharesPerLot,
+  quantityUnit,
+  formatMoney,
+  type Market,
+} from "@/lib/util/units";
 import { holdings as holdingsTable } from "@/lib/db/schema/holdings";
 import { priceAlerts } from "@/lib/db/schema/price-alerts";
 import { tickers } from "@/lib/db/schema/tickers";
@@ -144,44 +158,90 @@ async function handleMessage(update: TelegramUpdate): Promise<void> {
     if (consumed) return;
   }
 
-  // Holdings import: /import or /匯入 — supports three modes:
-  //   1. caption with photo        → Claude Vision
-  //   2. /import + lines of text   → parse each line as "symbol lots price"
-  //   3. /import alone             → show usage help
+  // Holdings import: /import [tw|us] — supports two markets, photo or text
+  //   /import           → show market selector buttons
+  //   /import tw + ...  → TW import (photo or text)
+  //   /import us + ...  → US import (photo or text)
   const firstLineRaw = text.split(/\r?\n/)[0]!.trim();
-  const firstWord = firstLineRaw.split(/\s+/)[0]!.toLowerCase();
+  const tokens = firstLineRaw.split(/\s+/);
+  const firstWord = tokens[0]!.toLowerCase();
   if (firstWord === "/import" || firstWord === "/匯入") {
     const hasPhotoAttachment = !!(msg.photo?.length);
-    // rest of first line after /import keyword (for single-line usage like
-    // "/import 2330 10 985.5") + all subsequent lines
-    const firstLineRest = firstLineRaw.replace(/^\S+\s*/, "");
+
+    // Optional market token: /import tw, /import us
+    const second = tokens[1]?.toLowerCase();
+    const marketArg: Market | null =
+      second === "tw" ? "TW" : second === "us" ? "US" : null;
+
+    // Body = everything after /import [market_token]
+    const dropTokens = marketArg ? 2 : 1;
+    const firstLineRest = tokens.slice(dropTokens).join(" ");
     const bodyLines = [firstLineRest, ...text.split(/\r?\n/).slice(1)];
     const bodyText = bodyLines.join("\n").trim();
 
+    // No market specified + no body + no photo → show selector buttons
+    if (!marketArg && !hasPhotoAttachment && !bodyText) {
+      await sendMessage({
+        chat_id: msg.chat.id,
+        text: [
+          "📥 <b>選擇要匯入的市場</b>",
+          "",
+          "點按鈕後依指示傳送持股截圖或文字。",
+        ].join("\n"),
+        parse_mode: "HTML",
+        reply_markup: {
+          inline_keyboard: [[
+            { text: "🇹🇼 台股", callback_data: "imp:tw" },
+            { text: "🇺🇸 美股", callback_data: "imp:us" },
+          ]],
+        },
+      });
+      return;
+    }
+
+    // No market specified but has body / photo → ask user to re-send with market
+    if (!marketArg) {
+      await sendMessage({
+        chat_id: msg.chat.id,
+        text: [
+          "❓ 請指定市場：",
+          "• 台股：第一行 <code>/import tw</code>",
+          "• 美股：第一行 <code>/import us</code>",
+          "",
+          "範例（台股文字）：",
+          "<pre>/import tw",
+          "2330 10 985.5",
+          "0050 5 168</pre>",
+          "範例（美股文字）：",
+          "<pre>/import us",
+          "AAPL 5 178",
+          "NVDA 3 850</pre>",
+          "或截圖上傳，caption 寫 <code>/import tw</code> 或 <code>/import us</code>",
+        ].join("\n"),
+        parse_mode: "HTML",
+      });
+      return;
+    }
+
     if (hasPhotoAttachment) {
-      await handleImportPhoto(profile.id, msg.chat.id, msg.photo!);
+      await handleImportPhoto(profile.id, msg.chat.id, msg.photo!, marketArg);
       return;
     }
     if (bodyText) {
-      await handleImportText(profile.id, msg.chat.id, bodyLines);
+      await handleImportText(profile.id, msg.chat.id, bodyLines, marketArg);
       return;
     }
+
+    // Just /import tw or /import us alone → tell user what to send
+    const flag = marketArg === "TW" ? "🇹🇼 台股" : "🇺🇸 美股";
     await sendMessage({
       chat_id: msg.chat.id,
       text: [
-        "❓ <b>/import 用法（擇一）</b>",
+        `📥 <b>${flag} 匯入</b>`,
         "",
-        "<b>方式一：文字批次（推薦）</b>",
-        "第一行輸入 <code>/import</code>，接著每行一筆持股：",
-        "<pre>/import",
-        "2330 10 985.5",
-        "1711 2 35",
-        "0050 5 168.2</pre>",
-        "格式：<code>代號 張數 成本</code>（空白或逗號分隔皆可）",
-        "",
-        "<b>方式二：截圖</b>",
-        "上傳持股截圖，caption 寫 <code>/import</code>",
-        "（目前僅支援一般股票與 ETF，權證/期貨會被略過）",
+        "現在請傳：",
+        "• 持股截圖（caption 寫 <code>/import " + marketArg.toLowerCase() + "</code>）",
+        "• 或文字（第一行 <code>/import " + marketArg.toLowerCase() + "</code>，後續每行 <code>代號 " + (marketArg === "TW" ? "張數" : "股數") + " 成本</code>）",
       ].join("\n"),
       parse_mode: "HTML",
     });
@@ -310,28 +370,31 @@ async function handleCommand(
       const lines = [
         "🤖 <b>Trading Intelligence Hub</b>",
         "",
+        "支援 🇹🇼 台股 + 🇺🇸 美股",
+        "",
         "可用指令：",
-        "/q 股票代號 — 查詢某支股票的所有情報",
-        "/stats — 查看情報總覽統計",
+        "/q 股票代號 — 查詢某支股票（例：<code>/q 2330</code>、<code>/q AAPL</code>）",
+        "/stats — 情報總覽（雙市場熱門 / 最新）",
         "/help — 顯示此說明",
         "",
         "📦 <b>持股管理：</b>",
-        "/buy 代號 張數 成本 — 買入，例如 <code>/buy 2330 10 985.5</code>",
-        "/sell — 互動選單（選持股 → 選張數，用 FinMind 現價）",
-        "/sell 代號 張數 賣價 — 指定價賣出，例如 <code>/sell 2330 5 1050</code>",
+        "/buy 代號 數量 成本 — 買入",
+        "  • 台股：<code>/buy 2330 10 985.5</code>（張）",
+        "  • 美股：<code>/buy AAPL 5 178</code>（股）",
+        "/sell — 互動選單（選持股 → 選數量）",
+        "/sell 代號 數量 賣價 — 指定價賣出",
         "/clear — 一鍵清倉（全數以現價賣出）",
-        "/portfolio — 查看我的持股與損益",
+        "/portfolio — 查看我的持股（可分台股/美股/全部）",
         "/import — 批次匯入持股：",
-        "  • 文字：<code>/import</code> 後每行寫 <code>代號 張數 成本</code>",
-        "  • 截圖：上傳圖片、caption 寫 /import",
-        "  （僅追蹤股票與 ETF；權證會自動略過）",
+        "  <code>/import tw</code> 或 <code>/import us</code> + 文字或截圖",
+        "  （僅追蹤股票/ETF；權證自動略過）",
         "",
         "🔔 <b>盤中警示：</b>",
-        "/alert 代號 +漲% -跌% vol 量倍數 — 設定警示條件",
-        "  例如 <code>/alert 2330 +3 -5</code>（漲 3% 或跌 5% 通知）",
-        "  或 <code>/alert 2330 -5 vol 2</code>（跌 5% 或量 2 倍通知）",
-        "/alerts — 列出所有已設定的警示",
-        "/unalert 代號 — 移除某檔警示",
+        "/alert 代號 +漲% -跌% vol 量倍數 — 設定警示",
+        "  例：<code>/alert 2330 +3 -5</code>、<code>/alert AAPL -3</code>",
+        "  美股盤通知時間 21:30-04:00 TST 之間",
+        "/alerts — 列出已設定的警示",
+        "/unalert 代號 — 移除警示",
       ];
       if (profile.role === "admin") {
         lines.push("", "（管理員限定）", "/invite — 產生新邀請碼");
@@ -399,7 +462,27 @@ async function handleCommand(
     }
 
     if (command === "/portfolio") {
-      await handlePortfolio(profile.id, chatId);
+      // Optional market arg: /portfolio tw / us / all
+      const arg = rawCommand.trim().split(/\s+/)[1]?.toLowerCase();
+      if (arg === "tw" || arg === "us" || arg === "all") {
+        await handlePortfolio(profile.id, chatId, arg);
+      } else {
+        // No arg → show selector buttons
+        await sendMessage({
+          chat_id: chatId,
+          text: "📊 <b>選擇要查看的市場：</b>",
+          parse_mode: "HTML",
+          reply_markup: {
+            inline_keyboard: [
+              [
+                { text: "🇹🇼 台股", callback_data: "pf:tw" },
+                { text: "🇺🇸 美股", callback_data: "pf:us" },
+              ],
+              [{ text: "全部", callback_data: "pf:all" }],
+            ],
+          },
+        });
+      }
       return;
     }
 
@@ -447,31 +530,32 @@ async function handleStats(chatId: number): Promise<void> {
   const WINDOW_DAYS = 30;
   const since = new Date(Date.now() - WINDOW_DAYS * 24 * 60 * 60 * 1000);
 
-  // All count-based sections group by the *content hash* of the source message
-  // so duplicate text (same opinion re-forwarded across groups or days) only
-  // counts once. Media-only messages have NULL content_hash, so we fall back
-  // to the raw_message id (which is unique) — media still counts as "unique".
-  //
-  // Expressed as a Postgres expression so we can reuse it in COUNT DISTINCT:
-  //   COALESCE(raw_messages.content_hash, raw_messages.id::text)
+  // Dedup key: same content hash → one count. Media (NULL hash) falls back
+  // to raw_message id so each media message is its own unit.
   const dedupKey = sql<string>`coalesce(${rawMessages.contentHash}, ${rawMessages.id}::text)`;
 
-  // Run independent queries in parallel.
-  const [sentimentRows, topSymbols, topIndustries, recentTips] = await Promise.all([
-    // Overall sentiment counts (last 30d) — one row per unique content hash
+  // Run independent queries in parallel — split top symbols/industries by market
+  const [
+    sentimentRows,
+    topSymbolsRaw,
+    topIndustriesRaw,
+    recentTips,
+  ] = await Promise.all([
     db
       .select({
         key: dedupKey,
         sentiment: tips.sentiment,
+        market: tips.market,
       })
       .from(tips)
       .innerJoin(aiClassifications, eq(aiClassifications.tipId, tips.id))
       .innerJoin(rawMessages, eq(aiClassifications.rawMessageId, rawMessages.id))
       .where(gte(tips.createdAt, since)),
 
-    // Top 10 mentioned symbols with per-sentiment breakdown (dedup by hash)
+    // Top symbols grouped by (market, symbol) — slice into TW/US in JS
     db
       .select({
+        market: tips.market,
         symbol: tipTickers.symbol,
         total: sql<number>`count(distinct ${dedupKey})::int`,
         bullish: sql<number>`count(distinct ${dedupKey}) filter (where ${tipTickers.sentiment} = 'bullish')::int`,
@@ -483,13 +567,13 @@ async function handleStats(chatId: number): Promise<void> {
       .innerJoin(aiClassifications, eq(aiClassifications.tipId, tips.id))
       .innerJoin(rawMessages, eq(aiClassifications.rawMessageId, rawMessages.id))
       .where(gte(tips.createdAt, since))
-      .groupBy(tipTickers.symbol)
-      .orderBy(desc(sql`count(distinct ${dedupKey})`))
-      .limit(10),
+      .groupBy(tips.market, tipTickers.symbol)
+      .orderBy(desc(sql`count(distinct ${dedupKey})`)),
 
-    // Top 5 industries (dedup by hash)
+    // Industries grouped by (market, industry)
     db
       .select({
+        market: tips.market,
         industry: tips.industryCategory,
         count: sql<number>`count(distinct ${dedupKey})::int`,
       })
@@ -503,12 +587,10 @@ async function handleStats(chatId: number): Promise<void> {
           sql`${tips.industryCategory} <> ''`
         )
       )
-      .groupBy(tips.industryCategory)
-      .orderBy(desc(sql`count(distinct ${dedupKey})`))
-      .limit(5),
+      .groupBy(tips.market, tips.industryCategory)
+      .orderBy(desc(sql`count(distinct ${dedupKey})`)),
 
-    // Most recent 5 tips — kept as chronological activity feed, NOT deduped
-    // (user wants to see recent submissions even if they're near-dupes)
+    // Most recent 5 tips — chronological feed, NOT deduped, mixed markets
     db
       .select({
         ticker: tips.ticker,
@@ -516,12 +598,20 @@ async function handleStats(chatId: number): Promise<void> {
         summary: tips.summary,
         targetPrice: tips.targetPrice,
         createdAt: tips.createdAt,
+        market: tips.market,
       })
       .from(tips)
       .where(gte(tips.createdAt, since))
       .orderBy(desc(tips.createdAt))
       .limit(5),
   ]);
+
+  // Slice top symbols/industries by market, take top 5 per market
+  const topSymbolsTw = topSymbolsRaw.filter((r) => r.market === "TW").slice(0, 5);
+  const topSymbolsUs = topSymbolsRaw.filter((r) => r.market === "US").slice(0, 5);
+  const topIndustriesTw = topIndustriesRaw.filter((r) => r.market === "TW").slice(0, 3);
+  const topIndustriesUs = topIndustriesRaw.filter((r) => r.market === "US").slice(0, 3);
+  const topSymbols = [...topSymbolsTw, ...topSymbolsUs]; // legacy var for name lookup
 
   // Dedup the raw sentiment rows in JS: keep one sentiment per unique hash.
   // Same text → same AI classification → same sentiment, so first-seen wins.
@@ -582,31 +672,48 @@ async function handleStats(chatId: number): Promise<void> {
   lines.push("");
   lines.push(`共 <b>${total}</b> 則獨立情報　📈 ${bullish}　📉 ${bearish}　➡️ ${neutral}`);
 
-  // Top symbols
-  if (topSymbols.length > 0) {
+  // Helper to render a market section of top symbols
+  const renderTopSymbols = (
+    flag: string,
+    title: string,
+    rows: typeof topSymbolsRaw
+  ) => {
+    if (rows.length === 0) return;
     lines.push("");
-    lines.push(`🔥 <b>熱門個股 Top ${topSymbols.length}</b>`);
-    topSymbols.forEach((row, idx) => {
+    lines.push(`${flag} <b>${title}</b>`);
+    rows.forEach((row, idx) => {
       const label = formatSymbolName(row.symbol, tickerNameMap.get(row.symbol));
       const sentimentParts: string[] = [];
       if (row.bullish > 0) sentimentParts.push(`📈${row.bullish}`);
       if (row.bearish > 0) sentimentParts.push(`📉${row.bearish}`);
       if (row.neutral > 0) sentimentParts.push(`➡️${row.neutral}`);
-      const sentTail = sentimentParts.length > 0 ? ` ｜ ${sentimentParts.join(" ")}` : "";
+      const sentTail =
+        sentimentParts.length > 0 ? ` ｜ ${sentimentParts.join(" ")}` : "";
       lines.push(`${idx + 1}. <b>${label}</b>　${row.total} 次${sentTail}`);
     });
-  }
+  };
 
-  // Top industries
-  if (topIndustries.length > 0) {
+  renderTopSymbols("🇹🇼", "台股熱門", topSymbolsTw);
+  renderTopSymbols("🇺🇸", "美股熱門", topSymbolsUs);
+
+  // Top industries — paired sections
+  const renderIndustries = (
+    flag: string,
+    title: string,
+    rows: typeof topIndustriesRaw
+  ) => {
+    if (rows.length === 0) return;
     lines.push("");
-    lines.push("🏭 <b>熱門產業</b>");
-    for (const row of topIndustries) {
+    lines.push(`${flag} <b>${title}</b>`);
+    for (const row of rows) {
       lines.push(`• ${row.industry} ${row.count} 筆`);
     }
-  }
+  };
 
-  // Recent tips
+  renderIndustries("🏭", "台股熱門產業", topIndustriesTw);
+  renderIndustries("🏭", "美股熱門產業", topIndustriesUs);
+
+  // Recent tips (cross-market with flag)
   if (recentTips.length > 0) {
     lines.push("");
     lines.push("🆕 <b>最新情報</b>");
@@ -617,6 +724,7 @@ async function handleStats(chatId: number): Promise<void> {
         month: "2-digit",
         day: "2-digit",
       });
+      const flagPrefix = t.market === "US" ? "🇺🇸 " : t.market === "TW" ? "🇹🇼 " : "";
       const tkr = t.ticker
         ? ` <b>${formatSymbolName(t.ticker, tickerNameMap.get(t.ticker))}</b>`
         : "";
@@ -624,7 +732,7 @@ async function handleStats(chatId: number): Promise<void> {
         ? ` 目標 ${parseFloat(t.targetPrice).toLocaleString()}`
         : "";
       const summary = t.summary ? `\n  ${t.summary}` : "";
-      lines.push(`• ${date}${tkr} ${icon}${tgt}${summary}`);
+      lines.push(`• ${date} ${flagPrefix}${tkr} ${icon}${tgt}${summary}`);
     }
   }
 
@@ -653,26 +761,30 @@ async function handleQuery(rawCommand: string, chatId: number): Promise<void> {
     return;
   }
 
+  const market = classifyMarket(rawSymbol);
   const twKind = classifyTwSymbol(rawSymbol);
 
   // Expand bare Taiwan 4-5 digit codes to .TW / .TWO variants for tip matching
   const variants: string[] = [rawSymbol];
-  if (twKind === "stock") {
+  if (market === "TW" && twKind === "stock") {
     variants.push(`${rawSymbol}.TW`, `${rawSymbol}.TWO`);
   }
 
-  // Parallel: resolve ticker, fetch quote, fetch tips, fetch institutional
+  // Parallel: resolve ticker, fetch quote, fetch tips, fetch market-specific data
   const quoteStart = new Date();
   quoteStart.setDate(quoteStart.getDate() - 5);
   const quoteStartDate = quoteStart.toISOString().slice(0, 10);
 
-  const [ticker, quote, tipRows, instRows] = await Promise.all([
-    // Only stocks live in tickers DB; warrants bypass resolver
-    twKind === "stock" ? resolveTicker(rawSymbol) : Promise.resolve(null),
-    // FinMind serves both stock and warrant prices
-    twKind === "stock" || twKind === "warrant"
-      ? fetchLatestQuote(rawSymbol)
+  const [ticker, quote, tipRows, instRows, insiderRows, recRows, usProfile] = await Promise.all([
+    // TW stocks live in tickers; US tickers may be lazy-upserted
+    market === "TW" && twKind === "stock"
+      ? resolveTicker(rawSymbol)
+      : market === "US"
+      ? upsertUsTicker(rawSymbol)
       : Promise.resolve(null),
+    // Quote: market-aware via lib/price/client
+    market !== "unknown" ? fetchLatestQuote(rawSymbol) : Promise.resolve(null),
+    // Tips for this symbol
     db
       .select({
         sentiment: tipTickers.sentiment,
@@ -690,10 +802,18 @@ async function handleQuery(rawCommand: string, chatId: number): Promise<void> {
       .where(inArray(tipTickers.symbol, variants))
       .orderBy(desc(tips.createdAt))
       .limit(20),
-    // Institutional data is meaningful only for stocks, not warrants
-    twKind === "stock"
+    // TW institutional (法人)
+    market === "TW" && twKind === "stock"
       ? fetchInstitutionalInvestors(rawSymbol, quoteStartDate)
       : Promise.resolve(null),
+    // US insider transactions
+    market === "US"
+      ? fetchUsInsiderTransactions(rawSymbol, 5)
+      : Promise.resolve(null),
+    // US analyst recommendations
+    market === "US" ? fetchUsRecommendations(rawSymbol) : Promise.resolve(null),
+    // US company profile (for industry display)
+    market === "US" ? fetchUsCompanyProfile(rawSymbol) : Promise.resolve(null),
   ]);
 
   // If nothing at all — no price, no tips, no ticker match — report not found
@@ -704,7 +824,7 @@ async function handleQuery(rawCommand: string, chatId: number): Promise<void> {
         `❓ 找不到 <b>${rawSymbol}</b> 的任何資料。`,
         "",
         "可能原因：",
-        "• 代號格式錯誤（台股請用 4 位數字，如 <code>2330</code>）",
+        "• 代號格式錯誤（台股 4-5 位數字、美股大寫字母）",
         "• 該股票未被納入系統資料源",
       ].join("\n"),
       parse_mode: "HTML",
@@ -712,12 +832,15 @@ async function handleQuery(rawCommand: string, chatId: number): Promise<void> {
     return;
   }
 
-  // ── Build header: symbol + name + industry ─────────────────────────────────
-  const displayName = ticker?.name ?? "";
+  // ── Build header: symbol + name + industry/sector ──────────────────────────
+  const displayName = ticker?.name ?? usProfile?.name ?? "";
   const industryCat =
-    tipRows.find((r) => r.industryCategory)?.industryCategory ?? null;
+    market === "US"
+      ? usProfile?.industry ?? null
+      : tipRows.find((r) => r.industryCategory)?.industryCategory ?? null;
 
-  const headerParts = [`📊 <b>${rawSymbol}</b>`];
+  const flag = market === "US" ? "🇺🇸 " : market === "TW" ? "🇹🇼 " : "";
+  const headerParts = [`📊 ${flag}<b>${rawSymbol}</b>`];
   if (displayName) headerParts.push(displayName);
   if (twKind === "warrant") headerParts.push("（權證）");
   const header = industryCat
@@ -746,18 +869,59 @@ async function handleQuery(rawCommand: string, chatId: number): Promise<void> {
         ? "🔻"
         : "▪️";
 
-    const volLots = Math.round(quote.volume / 1000);
     lines.push("");
     lines.push(
       `${arrow} 現價 <b>${quote.close.toFixed(2)}</b>　${absStr ? absStr + "（" : ""}${pctStr}${absStr ? "）" : ""}`
     );
-    lines.push(
-      `　高 ${quote.high.toFixed(2)}　低 ${quote.low.toFixed(2)}　量 ${volLots.toLocaleString()} 張`
-    );
+    if (market === "TW") {
+      const volLots = Math.round(quote.volume / 1000);
+      lines.push(
+        `　高 ${quote.high.toFixed(2)}　低 ${quote.low.toFixed(2)}　量 ${volLots.toLocaleString()} 張`
+      );
+    } else {
+      // US: Finnhub /quote doesn't include volume; show high/low only
+      lines.push(`　高 ${quote.high.toFixed(2)}　低 ${quote.low.toFixed(2)}`);
+    }
     lines.push(`　資料日 ${dateLabel}`);
   }
 
-  // ── Institutional block (latest trading day only) ─────────────────────────
+  // ── US: Insider trades block ──────────────────────────────────────────────
+  if (insiderRows && insiderRows.length > 0) {
+    lines.push("");
+    lines.push(`<b>近期 Insider 異動（Form 4）</b>`);
+    for (const t of insiderRows) {
+      const dir = t.change > 0 ? "🟢 買" : "🔴 賣";
+      const shareAbs = Math.abs(t.change).toLocaleString();
+      const px = t.transactionPrice > 0 ? ` @${t.transactionPrice.toFixed(2)}` : "";
+      lines.push(
+        `　${t.transactionDate.slice(5)} ${dir} ${t.name} ${shareAbs} 股${px}`
+      );
+    }
+  }
+
+  // ── US: Analyst recommendations block (latest period) ─────────────────────
+  if (recRows && recRows.length > 0) {
+    const latest = recRows[0];
+    if (latest) {
+      const total =
+        latest.strongBuy +
+        latest.buy +
+        latest.hold +
+        latest.sell +
+        latest.strongSell;
+      lines.push("");
+      lines.push(`<b>分析師評級</b>（${latest.period.slice(0, 7)}，${total} 家）`);
+      const parts: string[] = [];
+      if (latest.strongBuy > 0) parts.push(`強買 ${latest.strongBuy}`);
+      if (latest.buy > 0) parts.push(`買 ${latest.buy}`);
+      if (latest.hold > 0) parts.push(`持有 ${latest.hold}`);
+      if (latest.sell > 0) parts.push(`賣 ${latest.sell}`);
+      if (latest.strongSell > 0) parts.push(`強賣 ${latest.strongSell}`);
+      lines.push(`　${parts.join("　")}`);
+    }
+  }
+
+  // ── TW: Institutional block (latest trading day only) ─────────────────────
   if (instRows && instRows.length > 0) {
     // Group by date, take latest date
     const byDate = new Map<string, typeof instRows>();
@@ -861,42 +1025,53 @@ async function handleBuy(
   if (!rawSymbol || !rawLots || !rawPrice) {
     await sendMessage({
       chat_id: chatId,
-      text: "❓ 用法：<code>/buy 代號 張數 成本</code>\n例如：<code>/buy 2330 10 985.5</code>",
+      text: [
+        "❓ <b>用法</b>",
+        "• 台股：<code>/buy 2330 10 985.5</code>（張數）",
+        "• 美股：<code>/buy AAPL 5 178.5</code>（股數）",
+      ].join("\n"),
       parse_mode: "HTML",
     });
     return;
   }
 
   const symbolUpper = rawSymbol.toUpperCase();
-  const kind = classifyTwSymbol(symbolUpper);
-  if (kind === "warrant") {
+  const market = classifyMarket(symbolUpper);
+
+  if (market === "unknown") {
     await sendMessage({
       chat_id: chatId,
-      text: [
-        "ℹ️ <b>本系統不追蹤權證</b>",
-        "",
-        "權證因到期日與高波動特性，不納入持倉管理。",
-      ].join("\n"),
+      text: "❌ 代號格式錯誤。台股請用 4-5 位數字（<code>2330</code>、<code>00878</code>）；美股請用大寫字母（<code>AAPL</code>、<code>NVDA</code>）",
       parse_mode: "HTML",
     });
     return;
   }
-  if (kind !== "stock") {
-    await sendMessage({
-      chat_id: chatId,
-      text: "❌ 代號格式錯誤，請輸入台股 4-5 位數字，例如 <code>2330</code>、<code>00878</code>",
-      parse_mode: "HTML",
-    });
-    return;
+
+  // For TW, also reject warrants explicitly
+  if (market === "TW") {
+    const kind = classifyTwSymbol(symbolUpper);
+    if (kind === "warrant") {
+      await sendMessage({
+        chat_id: chatId,
+        text: [
+          "ℹ️ <b>本系統不追蹤權證</b>",
+          "",
+          "權證因到期日與高波動特性，不納入持倉管理。",
+        ].join("\n"),
+        parse_mode: "HTML",
+      });
+      return;
+    }
   }
 
   const sharesLots = parseFloat(rawLots);
   const price = parseFloat(rawPrice);
+  const unit = quantityUnit(market);
 
   if (!isFinite(sharesLots) || sharesLots <= 0) {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 張數必須大於 0",
+      text: `❌ ${unit}數必須大於 0`,
       parse_mode: "HTML",
     });
     return;
@@ -911,21 +1086,31 @@ async function handleBuy(
     return;
   }
 
-  const ticker = await resolveTicker(symbolUpper);
-  const symbol = ticker?.symbol ?? `${symbolUpper}.TW`;
-  const displayName = ticker?.name ?? symbolUpper;
+  // Resolve / lazy-upsert ticker
+  let symbol: string;
+  let displayName: string;
+  if (market === "US") {
+    const upserted = await upsertUsTicker(symbolUpper);
+    symbol = upserted?.symbol ?? symbolUpper;
+    displayName = upserted?.name ?? symbolUpper;
+  } else {
+    const ticker = await resolveTicker(symbolUpper);
+    symbol = ticker?.symbol ?? `${symbolUpper}.TW`;
+    displayName = ticker?.name ?? symbolUpper;
+  }
 
   try {
     const result = await buyHolding({ userId, symbol, sharesLots, price });
     await sendMessage({
       chat_id: chatId,
       text: [
-        `✅ 已記錄 買入 ${symbolUpper} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
-        `持股更新為 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`,
+        `✅ 已記錄 買入 ${symbolUpper} ${displayName} ${sharesLots} ${unit} @${price.toFixed(2)}`,
+        `持股更新為 ${result.sharesLots} ${unit}，均價 ${result.avgCost.toFixed(2)}`,
       ].join("\n"),
       parse_mode: "HTML",
     });
 
+    // Alert prompt only for stocks (TW + US both supported)
     const [existing] = await db
       .select({ id: priceAlerts.id })
       .from(priceAlerts)
@@ -978,11 +1163,11 @@ async function handleSell(
   }
 
   const symbolUpper = rawSymbol.toUpperCase();
-  const kind = classifyTwSymbol(symbolUpper);
-  if (kind !== "stock") {
+  const market = classifyMarket(symbolUpper);
+  if (market === "unknown") {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 代號格式錯誤，請輸入台股 4-5 位數字，例如 <code>2330</code>",
+      text: "❌ 代號格式錯誤。台股 4-5 位數字（<code>2330</code>），美股大寫字母（<code>AAPL</code>）",
       parse_mode: "HTML",
     });
     return;
@@ -990,11 +1175,12 @@ async function handleSell(
 
   const sharesLots = parseFloat(rawLots);
   const price = parseFloat(rawPrice);
+  const unit = quantityUnit(market);
 
   if (!isFinite(sharesLots) || sharesLots <= 0) {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 張數必須大於 0",
+      text: `❌ ${unit}數必須大於 0`,
       parse_mode: "HTML",
     });
     return;
@@ -1009,9 +1195,17 @@ async function handleSell(
     return;
   }
 
-  const ticker = await resolveTicker(symbolUpper);
-  const symbol = ticker?.symbol ?? `${symbolUpper}.TW`;
-  const displayName = ticker?.name ?? symbolUpper;
+  let symbol: string;
+  let displayName: string;
+  if (market === "US") {
+    const upserted = await upsertUsTicker(symbolUpper);
+    symbol = upserted?.symbol ?? symbolUpper;
+    displayName = upserted?.name ?? symbolUpper;
+  } else {
+    const ticker = await resolveTicker(symbolUpper);
+    symbol = ticker?.symbol ?? `${symbolUpper}.TW`;
+    displayName = ticker?.name ?? symbolUpper;
+  }
 
   try {
     // 先查均價（用於計算實現損益）
@@ -1025,18 +1219,19 @@ async function handleSell(
 
     const result = await sellHolding({ userId, symbol, sharesLots, price });
 
-    // 計算實現損益
+    // 計算實現損益（市場感知：TW 1 張 = 1000 股）
+    const multiplier = sharesPerLot(market);
     let pnlText = "";
     if (avgCost !== null) {
-      const realizedPnl = (price - avgCost) * sharesLots * 1000;
+      const realizedPnl = (price - avgCost) * sharesLots * multiplier;
       const pnlPct = avgCost > 0 ? ((price - avgCost) / avgCost) * 100 : 0;
       const sign = realizedPnl >= 0 ? "+" : "";
-      pnlText = `\n實現損益：${sign}NT$${realizedPnl.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}（${sign}${pnlPct.toFixed(1)}%）`;
+      pnlText = `\n實現損益：${formatMoney(realizedPnl, symbol, { withSign: true })}（${sign}${pnlPct.toFixed(1)}%）`;
     }
 
     const afterText = result === null
       ? "持股已全數賣出"
-      : `剩餘 ${result.sharesLots} 張，均價 ${result.avgCost.toFixed(2)}`;
+      : `剩餘 ${result.sharesLots} ${unit}，均價 ${result.avgCost.toFixed(2)}`;
 
     // When fully sold out, also remove any price alert — user no longer
     // holds it so the alert is noise. Partial sells keep the alert.
@@ -1056,7 +1251,7 @@ async function handleSell(
     await sendMessage({
       chat_id: chatId,
       text: [
-        `✅ 已記錄 賣出 ${rawSymbol} ${displayName} ${sharesLots} 張 @${price.toFixed(2)}`,
+        `✅ 已記錄 賣出 ${rawSymbol} ${displayName} ${sharesLots} ${unit} @${price.toFixed(2)}`,
         afterText + pnlText + alertRemovedNote,
       ].join("\n"),
       parse_mode: "HTML",
@@ -1092,66 +1287,115 @@ async function handleSell(
 
 // ─── Holdings: /portfolio ─────────────────────────────────────────────────────
 
-async function handlePortfolio(userId: string, chatId: number): Promise<void> {
+async function handlePortfolio(
+  userId: string,
+  chatId: number,
+  marketFilter: "tw" | "us" | "all" = "all"
+): Promise<void> {
   try {
-    const rows = await listPortfolio(userId);
+    const allRows = await listPortfolio(userId);
+
+    const rows =
+      marketFilter === "all"
+        ? allRows
+        : allRows.filter((r) =>
+            marketFilter === "tw" ? r.market === "TW" : r.market === "US"
+          );
 
     if (rows.length === 0) {
+      const labelEmpty =
+        marketFilter === "all"
+          ? "你目前沒有持股，使用 /buy 開始記錄"
+          : marketFilter === "tw"
+          ? "目前沒有台股持倉"
+          : "目前沒有美股持倉";
       await sendMessage({
         chat_id: chatId,
-        text: "📭 你目前沒有持股，使用 /buy 開始記錄",
+        text: `📭 ${labelEmpty}`,
         parse_mode: "HTML",
       });
       return;
     }
 
-    const lines: string[] = ["📊 <b>我的持股</b>", ""];
+    const headerLabel =
+      marketFilter === "all" ? "我的持股" :
+      marketFilter === "tw" ? "我的持股 ｜ 🇹🇼 台股" : "我的持股 ｜ 🇺🇸 美股";
 
-    let totalCost = 0;
-    let totalValue = 0;
-    let allHavePrice = true;
+    const lines: string[] = [`📊 <b>${headerLabel}</b>`, ""];
 
-    rows.forEach((row, idx) => {
-      const label = formatSymbolName(row.symbol, row.name);
-      const lotsStr = row.sharesLots % 1 === 0
-        ? String(row.sharesLots)
-        : row.sharesLots.toFixed(1);
+    // For "all", group by market for cleaner display
+    const groupedByMarket = marketFilter === "all"
+      ? [
+          { name: "🇹🇼 台股", subset: rows.filter((r) => r.market === "TW") },
+          { name: "🇺🇸 美股", subset: rows.filter((r) => r.market === "US") },
+        ].filter((g) => g.subset.length > 0)
+      : [{ name: "", subset: rows }];
 
-      lines.push(`${idx + 1}. <b>${label}</b> ${lotsStr} 張 @${row.avgCost.toFixed(2)}`);
+    // Track per-currency totals (TW pnl in NTD, US pnl in USD — don't mix)
+    type Tally = { cost: number; value: number; allHavePrice: boolean };
+    const totals: { TW: Tally; US: Tally } = {
+      TW: { cost: 0, value: 0, allHavePrice: true },
+      US: { cost: 0, value: 0, allHavePrice: true },
+    };
 
-      if (row.currentPrice !== null && row.marketValue !== null && row.pnl !== null && row.pnlPct !== null) {
-        const sign = row.pnl >= 0 ? "+" : "";
-        const pnlSign = row.pnl >= 0 ? "+" : "";
-        lines.push(
-          `   現價 ${row.currentPrice.toFixed(2)}（${sign}${row.pnlPct.toFixed(2)}%）`
-        );
-        lines.push(
-          `   市值 NT$${row.marketValue.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}（${pnlSign}NT$${Math.abs(row.pnl).toLocaleString("zh-TW", { maximumFractionDigits: 0 })}）`
-        );
-        totalValue += row.marketValue;
-      } else {
-        lines.push("   現價 無法取得");
-        allHavePrice = false;
-        totalValue += row.costBasis; // fallback
+    for (const group of groupedByMarket) {
+      if (group.name) {
+        lines.push(`<b>${group.name}</b>`);
       }
+      group.subset.forEach((row, idx) => {
+        const label = formatSymbolName(row.symbol, row.name);
+        const unit = quantityUnit(row.market);
+        const lotsStr = row.sharesLots % 1 === 0
+          ? String(row.sharesLots)
+          : row.sharesLots.toFixed(2);
 
-      totalCost += row.costBasis;
-      lines.push("");
-    });
+        lines.push(
+          `${idx + 1}. <b>${label}</b> ${lotsStr} ${unit} @${row.avgCost.toFixed(2)}`
+        );
+
+        if (
+          row.currentPrice !== null &&
+          row.marketValue !== null &&
+          row.pnl !== null &&
+          row.pnlPct !== null
+        ) {
+          const pnlSign = row.pnl >= 0 ? "+" : "";
+          lines.push(
+            `   現價 ${row.currentPrice.toFixed(2)}（${pnlSign}${row.pnlPct.toFixed(2)}%）`
+          );
+          lines.push(
+            `   市值 ${formatMoney(row.marketValue, row.symbol)}（${formatMoney(row.pnl, row.symbol, { withSign: true })}）`
+          );
+          totals[row.market].value += row.marketValue;
+        } else {
+          lines.push("   現價 無法取得");
+          totals[row.market].allHavePrice = false;
+          totals[row.market].value += row.costBasis;
+        }
+
+        totals[row.market].cost += row.costBasis;
+        lines.push("");
+      });
+    }
 
     lines.push("---");
-    lines.push(`總成本：NT$${totalCost.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}`);
-
-    if (allHavePrice) {
-      const totalPnl = totalValue - totalCost;
-      const totalPnlPct = totalCost > 0 ? (totalPnl / totalCost) * 100 : 0;
-      const sign = totalPnl >= 0 ? "+" : "";
-      lines.push(`總市值：NT$${totalValue.toLocaleString("zh-TW", { maximumFractionDigits: 0 })}`);
-      lines.push(
-        `未實現損益：${sign}NT$${Math.abs(totalPnl).toLocaleString("zh-TW", { maximumFractionDigits: 0 })}（${sign}${totalPnlPct.toFixed(2)}%）`
-      );
-    } else {
-      lines.push("（部分持股無法取得即時行情，損益計算不完整）");
+    for (const m of ["TW", "US"] as Market[]) {
+      const t = totals[m];
+      if (t.cost === 0) continue;
+      const sampleSym = m === "TW" ? "X" : "AAPL"; // sample for currency formatting
+      const pnl = t.value - t.cost;
+      const pnlPct = t.cost > 0 ? (pnl / t.cost) * 100 : 0;
+      const sign = pnl >= 0 ? "+" : "";
+      const flagged = m === "TW" ? "🇹🇼" : "🇺🇸";
+      lines.push(`${flagged} 總成本：${formatMoney(t.cost, sampleSym)}`);
+      if (t.allHavePrice) {
+        lines.push(`${flagged} 總市值：${formatMoney(t.value, sampleSym)}`);
+        lines.push(
+          `${flagged} 未實現損益：${formatMoney(pnl, sampleSym, { withSign: true })}（${sign}${pnlPct.toFixed(2)}%）`
+        );
+      } else {
+        lines.push(`${flagged} （部分持股無法取得即時行情）`);
+      }
     }
 
     await sendMessage({
@@ -1904,27 +2148,30 @@ async function handleAlertSet(
   }
 
   const rawSymbol = rawSymbolToken.toUpperCase();
-  const kind = classifyTwSymbol(rawSymbol);
-  if (kind === "unknown") {
+  const market = classifyMarket(rawSymbol);
+  if (market === "unknown") {
     await sendMessage({
       chat_id: chatId,
-      text: "❌ 代號格式錯誤，台股請用 4-5 位數字，例如 <code>2330</code>",
+      text: "❌ 代號格式錯誤。台股 4-5 位數字（<code>2330</code>），美股大寫字母（<code>AAPL</code>）",
       parse_mode: "HTML",
     });
     return;
   }
-  if (kind === "warrant") {
-    await sendMessage({
-      chat_id: chatId,
-      text: [
-        "⚠️ <b>權證不支援盤中警示</b>",
-        "",
-        "權證單日波動可能達數十 %，固定 % 門檻容易持續誤觸發。",
-        "如需追價請自行於券商 APP 設定。",
-      ].join("\n"),
-      parse_mode: "HTML",
-    });
-    return;
+  if (market === "TW") {
+    const kind = classifyTwSymbol(rawSymbol);
+    if (kind === "warrant") {
+      await sendMessage({
+        chat_id: chatId,
+        text: [
+          "⚠️ <b>權證不支援盤中警示</b>",
+          "",
+          "權證單日波動可能達數十 %，固定 % 門檻容易持續誤觸發。",
+          "如需追價請自行於券商 APP 設定。",
+        ].join("\n"),
+        parse_mode: "HTML",
+      });
+      return;
+    }
   }
 
   const parsed = parseAlertTokens(parts.slice(1));
@@ -1937,12 +2184,15 @@ async function handleAlertSet(
     return;
   }
 
-  // Resolve symbol
-  const ticker = await resolveTicker(rawSymbol);
+  // Resolve symbol — market-aware
+  const ticker =
+    market === "US"
+      ? await upsertUsTicker(rawSymbol)
+      : await resolveTicker(rawSymbol);
   if (!ticker) {
     await sendMessage({
       chat_id: chatId,
-      text: `❌ 找不到代號 <code>${rawSymbol}</code>，請確認是台股代碼。`,
+      text: `❌ 找不到代號 <code>${rawSymbol}</code>，請確認代號正確。`,
       parse_mode: "HTML",
     });
     return;
@@ -2255,7 +2505,8 @@ async function handleAlertSetupCallback(
 async function handleImportPhoto(
   userId: string,
   chatId: number,
-  photos: NonNullable<TelegramMessage["photo"]>
+  photos: NonNullable<TelegramMessage["photo"]>,
+  market: Market
 ): Promise<void> {
   // Use the largest photo size
   const largest = photos[photos.length - 1]!;
@@ -2308,7 +2559,7 @@ async function handleImportPhoto(
     parse_mode: "HTML",
   });
 
-  const parsed = await parseHoldingsPhoto(base64);
+  const parsed = await parseHoldingsPhoto(base64, market);
 
   if (!parsed || (parsed.items.length === 0 && parsed.skippedWarrants.length === 0)) {
     await sendMessage({
@@ -2351,7 +2602,8 @@ async function handleImportPhoto(
     parsed.items,
     "screenshot",
     [],
-    parsed.skippedWarrants
+    parsed.skippedWarrants,
+    market
   );
 }
 
@@ -2362,7 +2614,10 @@ async function handleImportPhoto(
  * be `symbol lots price` (separated by whitespace, comma, or tab). Returns
  * valid items plus the raw lines that failed to parse (for user feedback).
  */
-function parseImportTextLines(lines: string[]): {
+function parseImportTextLines(
+  lines: string[],
+  market: Market
+): {
   items: ParsedHoldingItem[];
   invalid: string[];
   skippedWarrants: string[];
@@ -2384,16 +2639,26 @@ function parseImportTextLines(lines: string[]): {
 
     const [symbolRaw, lotsRaw, priceRaw] = parts;
     const symbol = symbolRaw!.toUpperCase();
+    const detectedMarket = classifyMarket(symbol);
 
-    const kind = classifyTwSymbol(symbol);
-    if (kind === "warrant") {
-      skippedWarrants.push(symbol);
-      continue;
-    }
-    if (kind !== "stock") {
+    // Reject symbols from the wrong market — prevents typos cross-contaminating
+    if (detectedMarket !== market) {
       invalid.push(line);
       continue;
     }
+
+    if (market === "TW") {
+      const kind = classifyTwSymbol(symbol);
+      if (kind === "warrant") {
+        skippedWarrants.push(symbol);
+        continue;
+      }
+      if (kind !== "stock") {
+        invalid.push(line);
+        continue;
+      }
+    }
+    // For US, classifyMarket === "US" already validates the format
 
     const sharesLots = parseFloat(lotsRaw!);
     const price = parseFloat(priceRaw!);
@@ -2412,15 +2677,21 @@ function parseImportTextLines(lines: string[]): {
 async function handleImportText(
   userId: string,
   chatId: number,
-  lines: string[]
+  lines: string[],
+  market: Market
 ): Promise<void> {
-  const { items, invalid, skippedWarrants } = parseImportTextLines(lines);
+  const { items, invalid, skippedWarrants } = parseImportTextLines(lines, market);
+  const unit = quantityUnit(market);
 
   if (items.length === 0) {
     const warrantNote =
       skippedWarrants.length > 0
         ? `\n\n⚠️ 已略過 ${skippedWarrants.length} 檔權證（${skippedWarrants.slice(0, 5).join(", ")}）：本系統不追蹤權證。`
         : "";
+    const example =
+      market === "TW"
+        ? "<pre>/import tw\n2330 10 985.5\n1711 2 35</pre>"
+        : "<pre>/import us\nAAPL 5 178\nNVDA 3 850</pre>";
     await sendMessage({
       chat_id: chatId,
       text: [
@@ -2428,19 +2699,59 @@ async function handleImportText(
         "",
         invalid.length > 0
           ? `無法解析的行（共 ${invalid.length} 行）：\n<code>${escapeHtml(invalid.slice(0, 5).join("\n"))}</code>`
-          : "請確認每行格式為 <code>代號 張數 成本</code>",
+          : `請確認每行格式為 <code>代號 ${unit}數 成本</code>`,
         "",
         "<b>範例：</b>",
-        "<pre>/import",
-        "2330 10 985.5",
-        "1711 2 35</pre>",
+        example,
       ].join("\n") + warrantNote,
       parse_mode: "HTML",
     });
     return;
   }
 
-  await createImportPreview(userId, chatId, items, "text", invalid, skippedWarrants);
+  await createImportPreview(userId, chatId, items, "text", invalid, skippedWarrants, market);
+}
+
+// ─── Import market selector callback ────────────────────────────────────────
+
+async function handleImportMarketCallback(
+  query: TelegramCallbackQuery,
+  data: string
+): Promise<void> {
+  const arg = data.slice("imp:".length);
+  if (arg !== "tw" && arg !== "us") {
+    await answerCallbackQuery({ callback_query_id: query.id });
+    return;
+  }
+  await answerCallbackQuery({ callback_query_id: query.id });
+  if (query.message) {
+    await editMessageReplyMarkup({
+      chat_id: query.message.chat.id,
+      message_id: query.message.message_id,
+      reply_markup: { inline_keyboard: [] },
+    }).catch(() => {});
+  }
+
+  const flag = arg === "tw" ? "🇹🇼 台股" : "🇺🇸 美股";
+  const example =
+    arg === "tw"
+      ? "<pre>/import tw\n2330 10 985.5\n1711 2 35</pre>"
+      : "<pre>/import us\nAAPL 5 178\nNVDA 3 850</pre>";
+
+  await sendMessage({
+    chat_id: query.from.id,
+    text: [
+      `📥 <b>${flag} 匯入</b>`,
+      "",
+      "現在請傳：",
+      `• 持股截圖 + caption 寫 <code>/import ${arg}</code>`,
+      `• 或文字（第一行 <code>/import ${arg}</code>，後續每行 <code>代號 ${arg === "tw" ? "張數" : "股數"} 成本</code>）`,
+      "",
+      "範例：",
+      example,
+    ].join("\n"),
+    parse_mode: "HTML",
+  });
 }
 
 // ─── Holdings: shared preview + pending_imports writer ───────────────────────
@@ -2455,19 +2766,23 @@ async function createImportPreview(
   rawItems: ParsedHoldingItem[],
   source: "screenshot" | "text",
   invalid: string[] = [],
-  skippedWarrants: string[] = []
+  skippedWarrants: string[] = [],
+  market: Market = "TW"
 ): Promise<void> {
   // Hard cap: AI hallucination / copy-paste defence. 50 items covers any real portfolio.
   const items = rawItems.slice(0, 50);
+  const unit = quantityUnit(market);
 
   // Remove any prior pending imports from this user — only one active at a time
   await db.delete(pendingImports).where(eq(pendingImports.userId, userId));
 
+  // Stuff market into the payload so confirm can route correctly.
+  // Backward-compat: bare array still parses as TW (default).
   const [pending] = await db
     .insert(pendingImports)
     .values({
       userId,
-      payload: items as unknown as typeof pendingImports.$inferInsert["payload"],
+      payload: { market, items } as unknown as typeof pendingImports.$inferInsert["payload"],
     })
     .returning({ id: pendingImports.id });
 
@@ -2483,14 +2798,15 @@ async function createImportPreview(
   const previewLines = items.map((item, idx) => {
     const lotsStr = item.sharesLots % 1 === 0
       ? String(item.sharesLots)
-      : item.sharesLots.toFixed(1);
-    return `${idx + 1}. ${item.symbol}　${lotsStr} 張　@${item.avgCost.toFixed(2)}`;
+      : item.sharesLots.toFixed(2);
+    return `${idx + 1}. ${item.symbol}　${lotsStr} ${unit}　@${item.avgCost.toFixed(2)}`;
   });
 
+  const flag = market === "US" ? "🇺🇸 " : "🇹🇼 ";
   const header =
     source === "screenshot"
-      ? "📋 <b>從截圖辨識到以下持股，請確認是否匯入：</b>"
-      : "📋 <b>從文字解析到以下持股，請確認是否匯入：</b>";
+      ? `📋 <b>${flag}從截圖辨識到以下持股，請確認是否匯入：</b>`
+      : `📋 <b>${flag}從文字解析到以下持股，請確認是否匯入：</b>`;
 
   const bodyLines: string[] = [header, "", ...previewLines];
   if (skippedWarrants.length > 0) {
@@ -2666,6 +2982,40 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
   // ── Clear (/clear): "clear:confirm" or "clear:cancel" ────────────────────
   if (data.startsWith("clear:")) {
     await handleClearCallback(query, data);
+    return;
+  }
+
+  // ── /portfolio market selector: "pf:tw" / "pf:us" / "pf:all" ─────────────
+  if (data.startsWith("pf:")) {
+    const arg = data.slice(3);
+    if (arg !== "tw" && arg !== "us" && arg !== "all") {
+      await answerCallbackQuery({ callback_query_id: query.id });
+      return;
+    }
+    const [profile] = await db
+      .select({ id: userProfiles.id })
+      .from(userProfiles)
+      .where(eq(userProfiles.telegramId, query.from.id))
+      .limit(1);
+    if (!profile) {
+      await answerCallbackQuery({ callback_query_id: query.id, text: "找不到帳號" });
+      return;
+    }
+    await answerCallbackQuery({ callback_query_id: query.id });
+    if (query.message) {
+      await editMessageReplyMarkup({
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        reply_markup: { inline_keyboard: [] },
+      }).catch(() => {});
+    }
+    await handlePortfolio(profile.id, query.from.id, arg);
+    return;
+  }
+
+  // ── /import market selector: "imp:tw" / "imp:us" ─────────────────────────
+  if (data.startsWith("imp:")) {
+    await handleImportMarketCallback(query, data);
     return;
   }
 
@@ -2851,11 +3201,19 @@ async function handleImportCallback(
   }
 
   // confirm: write to holdings
-  const items = pending.payload as PendingImportItem[];
+  // Payload may be either {market, items} (new) or PendingImportItem[] (legacy)
+  const rawPayload = pending.payload as
+    | PendingImportItem[]
+    | { market: Market; items: PendingImportItem[] };
+  const items: PendingImportItem[] = Array.isArray(rawPayload)
+    ? rawPayload
+    : rawPayload.items;
+  const payloadMarket: Market = Array.isArray(rawPayload)
+    ? "TW"
+    : rawPayload.market;
 
-  // Pre-resolve all symbols. Warrants and non-stock formats should have been
-  // filtered upstream (photo parser + text parser), so any row that fails
-  // resolver here is genuinely unknown.
+  // Pre-resolve all symbols. For TW go through tickers DB; for US use
+  // upsertUsTicker (lazy Finnhub fetch).
   type ResolvedItem = {
     symbol: string;
     sharesLots: number;
@@ -2865,17 +3223,31 @@ async function handleImportCallback(
   const resolved: ResolvedItem[] = [];
   const unresolved: string[] = [];
   for (const item of items) {
-    const ticker = await resolveTicker(item.symbol);
-    if (!ticker) {
-      unresolved.push(item.symbol);
-      continue;
+    if (payloadMarket === "US") {
+      const t = await upsertUsTicker(item.symbol);
+      if (!t) {
+        unresolved.push(item.symbol);
+        continue;
+      }
+      resolved.push({
+        symbol: t.symbol,
+        sharesLots: item.sharesLots,
+        avgCost: item.avgCost,
+        rawSymbol: item.symbol,
+      });
+    } else {
+      const ticker = await resolveTicker(item.symbol);
+      if (!ticker) {
+        unresolved.push(item.symbol);
+        continue;
+      }
+      resolved.push({
+        symbol: ticker.symbol,
+        sharesLots: item.sharesLots,
+        avgCost: item.avgCost,
+        rawSymbol: item.symbol,
+      });
     }
-    resolved.push({
-      symbol: ticker.symbol,
-      sharesLots: item.sharesLots,
-      avgCost: item.avgCost,
-      rawSymbol: item.symbol,
-    });
   }
 
   // If ANY row is unresolved, abort the entire import — user should check the list

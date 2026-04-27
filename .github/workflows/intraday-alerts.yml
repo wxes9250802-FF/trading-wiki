@@ -1,10 +1,17 @@
 name: Intraday Alerts
 
+# Schedule covers BOTH markets:
+#   TW (Mon-Fri TST 09:30-13:30) = UTC 01:30-05:30 on Mon-Fri
+#   US (Mon-Fri ET 09:30-16:00)  = UTC 13:30-21:00 (DST) or 14:30-21:00 (standard)
+# We use the wider window 13:30-21:30 UTC weekdays to cover both DST and standard
+# time. The worker treats each symbol independently, so off-hours symbols just
+# fail the "latest bar is today" check and are skipped silently.
 on:
   schedule:
-    # Taipei 09:30, 10:30, 11:30, 12:30, 13:30 on weekdays
-    # = UTC 01:30, 02:30, 03:30, 04:30, 05:30
+    # TW market hours
     - cron: "30 1-5 * * 1-5"
+    # US market hours (covers both EDT and EST)
+    - cron: "30 13-21 * * 1-5"
   workflow_dispatch:
 
 concurrency:
@@ -25,4 +32,5 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           SKIP_ENV_VALIDATION: "true"
