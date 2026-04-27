@@ -75,7 +75,7 @@ const SYSTEM_PROMPT = `你是一個台股交易情報分析師。分析以下 Te
   "summary": "一句話摘要（繁體中文，100字以內）",
   "confidence": 整數0到100,
   "tickers": [
-    { "symbol": "4位數字代碼", "sentiment": "bullish"|"bearish"|"neutral", "target_price": 目標價（可省略）}
+    { "symbol": "4-5位數字代碼", "sentiment": "bullish"|"bearish"|"neutral", "target_price": 目標價（可省略）}
   ],
   "company_description": "主要標的的公司業務簡述（繁體中文，50字以內，例如「台積電為全球最大晶圓代工廠」）",
   "sector_position": "此股在產業內的相對地位（例如「龍頭」「二線」「中小型」「後段」，盡量簡短）"
@@ -85,7 +85,11 @@ const SYSTEM_PROMPT = `你是一個台股交易情報分析師。分析以下 Te
 - market: 固定為 "TW"
 - sentiment: bullish=看多, bearish=看空, neutral=中性觀察
 - confidence: 判斷這是明確可行情報的信心，不確定則給低分
-- tickers.symbol: 台股 4-6 位數字代碼，例如 "2330"、"6451"（不加 .TW 後綴）
+- tickers.symbol: 台股代碼（不加 .TW 後綴）。包含：
+    • 4 位數一般股票（例「2330」「6451」「1101」）
+    • 4 位數 ETF（例「0050」「0056」）
+    • 5 位數 ETF（例「00878」「00940」「006208」）
+  ETF 也是合法的情報標的，請當作一般股票照常抽出，**不要因為是 ETF 就跳過**
 - target_price: 新台幣目標價，若原訊息無提及則省略此欄位
 - company_description: 主要標的的公司業務簡述（50字以內）；無法判斷可省略
 - sector_position: 此股在產業內的相對地位（例如「龍頭」「二線」「中小型」「後段」）；無法判斷可省略
