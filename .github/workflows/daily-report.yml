@@ -27,4 +27,5 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           FINMIND_TOKEN: ${{ secrets.FINMIND_TOKEN }}
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
           SKIP_ENV_VALIDATION: "true"

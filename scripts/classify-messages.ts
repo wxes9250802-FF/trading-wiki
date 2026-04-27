@@ -37,6 +37,7 @@ import { classifyMessage, DEFAULT_MODEL, PROMPT_VERSION, type ClassifyMedia } fr
 import { findSemanticMatch } from "@/lib/ai/semantic-match";
 import { fetchCurrentPrice } from "@/lib/price/client";
 import { fetchStockInfo } from "@/lib/finmind/client";
+import { fetchUsCompanyProfile } from "@/lib/finnhub/client";
 import { sendMessage } from "@/lib/telegram/client";
 import type { RawMessage } from "@/lib/db/schema/raw-messages";
 
@@ -228,19 +229,54 @@ async function processMessage(msg: RawMessage): Promise<void> {
     const { result, model, inputTokens, outputTokens, rawResponse } =
       await classifyMessage(msg.messageText, DEFAULT_MODEL, media);
 
-    // Pre-resolve primary symbol and fetch FinMind data BEFORE opening the
+    // Pre-resolve primary symbol and fetch market data BEFORE opening the
     // transaction — avoids holding a DB connection open during HTTP calls.
+    // Market-aware: TW → FinMind, US → Finnhub.
     let primarySymbol: string | null = null;
     let industryCategory: string | null = null;
     if (result.is_tip) {
       const primaryRaw = result.tickers[0];
       if (primaryRaw) {
-        primarySymbol = await resolveSymbol(primaryRaw.symbol);
-        try {
-          const stockInfo = await fetchStockInfo(primarySymbol);
-          industryCategory = stockInfo?.industryCategory ?? null;
-        } catch {
-          // Non-fatal — classification continues without industry data
+        if (result.market === "US") {
+          // US: upsert into tickers via Finnhub profile
+          const profile = await fetchUsCompanyProfile(primaryRaw.symbol);
+          if (profile) {
+            primarySymbol = profile.symbol;
+            industryCategory = profile.industry;
+            // Best-effort upsert into tickers
+            try {
+              const exch = (profile.exchange || "").toUpperCase();
+              const exchEnum: "NYSE" | "NASDAQ" | "OTHER" = exch.includes("NASDAQ")
+                ? "NASDAQ"
+                : exch.includes("NYSE") || exch.includes("NEW YORK")
+                ? "NYSE"
+                : "OTHER";
+              await db
+                .insert(tickers)
+                .values({
+                  symbol: profile.symbol,
+                  name: profile.name,
+                  exchange: exchEnum,
+                })
+                .onConflictDoUpdate({
+                  target: tickers.symbol,
+                  set: { name: profile.name, lastUpdated: new Date() },
+                });
+            } catch (err) {
+              console.warn("    [classify] tickers upsert failed:", err);
+            }
+          } else {
+            primarySymbol = primaryRaw.symbol.toUpperCase();
+          }
+        } else {
+          // TW (default)
+          primarySymbol = await resolveSymbol(primaryRaw.symbol);
+          try {
+            const stockInfo = await fetchStockInfo(primarySymbol);
+            industryCategory = stockInfo?.industryCategory ?? null;
+          } catch {
+            // Non-fatal — classification continues without industry data
+          }
         }
       }
     }
@@ -355,12 +391,15 @@ async function processMessage(msg: RawMessage): Promise<void> {
 
         if (!tip) throw new Error("Failed to insert tip row");
 
-        // Resolve raw AI symbols → canonical symbols from tickers table
-        // (runs outside the transaction to avoid long-held locks)
+        // Resolve raw AI symbols → canonical symbols. TW goes through tickers
+        // table (.TW/.TWO suffix); US stays bare (uppercase letters).
         const resolvedTickers = await Promise.all(
           result.tickers.map(async (t) => ({
             ...t,
-            symbol: await resolveSymbol(t.symbol),
+            symbol:
+              result.market === "US"
+                ? t.symbol.toUpperCase()
+                : await resolveSymbol(t.symbol),
           }))
         );
 

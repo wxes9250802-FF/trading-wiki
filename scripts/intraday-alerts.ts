@@ -30,7 +30,9 @@ import { sql as drizzleSql } from "drizzle-orm";
 
 import { intradayAlertLog } from "@/lib/db/schema/intraday-alerts";
 import { fetchDailyOHLCV } from "@/lib/finmind/client";
+import { fetchYahooOhlcv } from "@/lib/price/yahoo-fallback";
 import { sendMessage } from "@/lib/telegram/client";
+import { classifyMarket } from "@/lib/ticker/classify";
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -183,6 +185,10 @@ async function recordAlert(
 
 // ─── Message builders ─────────────────────────────────────────────────────────
 
+function priceLabel(symbol: string): string {
+  return classifyMarket(symbol) === "US" ? "US$" : "NT$";
+}
+
 function buildPriceUpMessage(opts: {
   symbol: string;
   changeRatio: number;
@@ -190,12 +196,13 @@ function buildPriceUpMessage(opts: {
   prevClose: number;
   threshold: number; // user's up_pct in %
 }): string {
+  const px = priceLabel(opts.symbol);
   return [
     `🚀 <b>你關注的 ${opts.symbol} 急漲觸發</b>`,
     ``,
-    `今日漲幅：${fmtPct(opts.changeRatio)}（門檻 ≥ ${opts.threshold.toFixed(1)}%）`,
-    `目前價：NT$${opts.todayClose.toLocaleString("zh-TW")}`,
-    `昨收：NT$${opts.prevClose.toLocaleString("zh-TW")}`,
+    `漲幅：${fmtPct(opts.changeRatio)}（門檻 ≥ ${opts.threshold.toFixed(1)}%）`,
+    `現價:${px}${opts.todayClose.toLocaleString("en-US", { maximumFractionDigits: 4 })}`,
+    `前收：${px}${opts.prevClose.toLocaleString("en-US", { maximumFractionDigits: 4 })}`,
     ``,
     `本提醒不構成投資建議。`,
   ].join("\n");
@@ -208,12 +215,13 @@ function buildPriceDownMessage(opts: {
   prevClose: number;
   threshold: number; // user's down_pct (negative)
 }): string {
+  const px = priceLabel(opts.symbol);
   return [
     `⚠️ <b>你關注的 ${opts.symbol} 急跌觸發</b>`,
     ``,
-    `今日跌幅：${fmtPct(opts.changeRatio)}（門檻 ≤ ${opts.threshold.toFixed(1)}%）`,
-    `目前價：NT$${opts.todayClose.toLocaleString("zh-TW")}`,
-    `昨收：NT$${opts.prevClose.toLocaleString("zh-TW")}`,
+    `跌幅：${fmtPct(opts.changeRatio)}（門檻 ≤ ${opts.threshold.toFixed(1)}%）`,
+    `現價：${px}${opts.todayClose.toLocaleString("en-US", { maximumFractionDigits: 4 })}`,
+    `前收：${px}${opts.prevClose.toLocaleString("en-US", { maximumFractionDigits: 4 })}`,
     ``,
     `請留意後續走勢，本提醒不構成投資建議。`,
   ].join("\n");
@@ -266,11 +274,19 @@ async function computeSymbolStats(
   startDate: string
 ): Promise<SymbolStats | null> {
   const stockId = stripSuffix(symbol);
-  const ohlcv = await fetchDailyOHLCV(stockId, startDate);
-  await sleep(FINMIND_SLEEP_MS);
+  const market = classifyMarket(symbol);
+
+  let ohlcv: OhlcvRow[] | null;
+  if (market === "US") {
+    // US: Yahoo daily OHLCV (Finnhub free no longer serves /stock/candle)
+    ohlcv = await fetchYahooOhlcv(symbol, "1mo");
+  } else {
+    ohlcv = await fetchDailyOHLCV(stockId, startDate);
+    await sleep(FINMIND_SLEEP_MS);
+  }
 
   if (ohlcv === null) {
-    console.warn(`  [${stockId}] fetchDailyOHLCV returned null`);
+    console.warn(`  [${stockId}] OHLCV fetch returned null`);
     return null;
   }
   if (ohlcv.length < 2) {
@@ -282,7 +298,10 @@ async function computeSymbolStats(
   const todayRow = sorted[sorted.length - 1]!;
   const prevRow = sorted[sorted.length - 2]!;
 
-  if (todayRow.date !== todayStr) {
+  // For TW: enforce that latest bar is today (TST). For US: use whatever the
+  // latest available bar is — the cron also runs outside US hours so non-trading
+  // days are expected; we just operate on the most recent bar.
+  if (market !== "US" && todayRow.date !== todayStr) {
     console.log(`  [${stockId}] Latest data is ${todayRow.date}, not ${todayStr} — non-trading day`);
     return null;
   }

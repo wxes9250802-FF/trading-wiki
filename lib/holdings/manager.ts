@@ -4,6 +4,7 @@ import { db } from "@/lib/db/client";
 import { holdings, holdingTransactions } from "@/lib/db/schema/holdings";
 import { tickers } from "@/lib/db/schema/tickers";
 import { fetchCurrentPrice } from "@/lib/price/client";
+import { sharesPerLot, marketFromSymbol, type Market } from "@/lib/util/units";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -16,9 +17,11 @@ export interface HoldingResult {
 export interface PortfolioRow extends HoldingResult {
   /** Display name from tickers table; null for warrants or un-synced symbols */
   name: string | null;
+  /** "TW" or "US", inferred from symbol format. */
+  market: Market;
   currentPrice: number | null;
-  marketValue: number | null;  // sharesLots * 1000 * currentPrice
-  costBasis: number;           // sharesLots * 1000 * avgCost
+  marketValue: number | null;  // sharesLots * sharesPerLot(market) * currentPrice
+  costBasis: number;           // sharesLots * sharesPerLot(market) * avgCost
   pnl: number | null;          // marketValue - costBasis
   pnlPct: number | null;       // pnl / costBasis * 100
 }
@@ -197,12 +200,14 @@ export async function listPortfolio(userId: string): Promise<PortfolioRow[]> {
     .leftJoin(tickers, eq(tickers.symbol, holdings.symbol))
     .where(eq(holdings.userId, userId));
 
-  // 並行抓所有市價
+  // 並行抓所有市價（市場感知：TW 1 張 = 1000 股，US 1 lot = 1 股）
   const results = await Promise.all(
     rows.map(async (row) => {
       const sharesLots = parseFloat(row.sharesLots);
       const avgCost = parseFloat(row.avgCost);
-      const costBasis = sharesLots * 1000 * avgCost;
+      const market = marketFromSymbol(row.symbol);
+      const multiplier = sharesPerLot(market);
+      const costBasis = sharesLots * multiplier * avgCost;
 
       const currentPrice = await fetchCurrentPrice(row.symbol);
 
@@ -211,7 +216,7 @@ export async function listPortfolio(userId: string): Promise<PortfolioRow[]> {
       let pnlPct: number | null = null;
 
       if (currentPrice !== null) {
-        marketValue = sharesLots * 1000 * currentPrice;
+        marketValue = sharesLots * multiplier * currentPrice;
         pnl = marketValue - costBasis;
         pnlPct = costBasis > 0 ? (pnl / costBasis) * 100 : null;
       }
@@ -219,6 +224,7 @@ export async function listPortfolio(userId: string): Promise<PortfolioRow[]> {
       return {
         symbol: row.symbol,
         name: row.name,
+        market,
         sharesLots,
         avgCost,
         currentPrice,
