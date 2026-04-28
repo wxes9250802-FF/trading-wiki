@@ -1382,7 +1382,9 @@ async function handlePortfolio(
     for (const m of ["TW", "US"] as Market[]) {
       const t = totals[m];
       if (t.cost === 0) continue;
-      const sampleSym = m === "TW" ? "X" : "AAPL"; // sample for currency formatting
+      // Sample symbol for currency formatting: "2330" classifies as TW,
+      // "AAPL" as US. (Don't use single letters — "X" matches the US regex.)
+      const sampleSym = m === "TW" ? "2330" : "AAPL";
       const pnl = t.value - t.cost;
       const pnlPct = t.cost > 0 ? (pnl / t.cost) * 100 : 0;
       const sign = pnl >= 0 ? "+" : "";
